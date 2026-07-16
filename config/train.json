@@ -3,15 +3,15 @@
     "desc": "spanf_x2_scratch",
     "total_epochs": 300,
     "cycle_length": 300,
-    "max_lr": 0.0005,
+    "max_lr": 0.0003,
     "min_lr": 0.000001,
     "betas": [0.9, 0.99],
     "weight_decay": 0.0,
     "batch_size": 16,
     "num_workers": 8,
     "save_dir": "checkpoints/run_{timestamp}_{desc}",
-    "save_interval": 10,
-    "val_interval": 1,
+    "save_interval": 100,
+    "val_interval": 10,
     "device": "auto",
     "seed": 1234,
     "resume": null,
@@ -21,9 +21,9 @@
     "cudnn_benchmark": true
   },
   "dataset": {
-    "train_hr_dir": "/path/to/train/HR",
+    "train_hr_dir": "/opt/data/private/dataset/rgb/DF2K/train",
     "train_lr_dir": null,
-    "val_hr_dir": "/path/to/val/HR",
+    "val_hr_dir": "/opt/data/private/dataset/rgb/DF2K/val",
     "val_lr_dir": null,
     "scale": 2,
     "lr_patch_size": 64,
@@ -32,7 +32,25 @@
     "val_ratio": 0.05,
     "seed": 1234,
     "augment": true,
-    "max_images": null
+    "max_images": null,
+    "degradation": {
+      "type": "realistic",
+      "blur_probability": 0.8,
+      "kernel_size": 15,
+      "isotropic_probability": 0.5,
+      "sigma_range": [0.2, 2.0],
+      "rotation_range": [-3.1416, 3.1416],
+      "resize_modes": ["bicubic", "bilinear", "lanczos"],
+      "resize_probabilities": [0.5, 0.25, 0.25],
+      "noise_probability": 0.8,
+      "gaussian_noise_probability": 0.6,
+      "gray_noise_probability": 0.2,
+      "gaussian_sigma_range": [1.0, 10.0],
+      "poisson_peak_range": [100.0, 1000.0],
+      "jpeg_probability": 0.8,
+      "jpeg_quality_range": [60, 95],
+      "jpeg_subsampling": 2
+    }
   },
   "model": {
     "type": "spanf",
@@ -48,7 +66,7 @@
   },
   "validation": {
     "crop_border": 2,
-    "tile_size": 0,
+    "tile_size": 256,
     "tile_pad": 24
   }
 }

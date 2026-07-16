@@ -64,9 +64,56 @@ dataset/val/LR/0801x2.png
 
 ### 只有 HR
 
-把 `train_lr_dir` 和 `val_lr_dir` 设为 `null`，dataset 会使用 Pillow bicubic 在线生成 ×2 LR。
+把 `train_lr_dir` 和 `val_lr_dir` 设为 `null`，dataset 会从 HR 在线生成 ×2 LR。默认使用
+Pillow bicubic；将 `dataset.degradation.type` 设为 `"realistic"` 后，训练集会依次应用随机
+Gaussian/anisotropic blur、bilinear/bicubic/Lanczos 下采样、Gaussian/Poisson 噪声和 JPEG 压缩。
+各退化步骤的概率和强度范围均可在 `dataset.degradation` 中配置。验证集始终使用确定性的
+bicubic 下采样，使不同 epoch 的 PSNR 可直接比较。
+
 如果没有单独验证集，也可以把 `val_hr_dir` 设为 `null`，代码会按 `val_ratio` 从训练 HR 中
-固定划分验证集。
+固定划分验证集。若使用真实退化，推荐的初始配置如下：
+
+```json
+{
+  "degradation": {
+    "type": "realistic",
+    "blur_probability": 0.8,
+    "kernel_size": 15,
+    "isotropic_probability": 0.5,
+    "sigma_range": [0.2, 2.0],
+    "rotation_range": [-3.1416, 3.1416],
+    "resize_modes": ["bicubic", "bilinear", "lanczos"],
+    "resize_probabilities": [0.5, 0.25, 0.25],
+    "noise_probability": 0.8,
+    "gaussian_noise_probability": 0.6,
+    "gray_noise_probability": 0.2,
+    "gaussian_sigma_range": [1.0, 10.0],
+    "poisson_peak_range": [100.0, 1000.0],
+    "jpeg_probability": 0.8,
+    "jpeg_quality_range": [60, 95],
+    "jpeg_subsampling": 2
+  }
+}
+```
+
+`gaussian_sigma_range` 的单位是 8-bit 像素值，`poisson_peak_range` 越小表示噪声越强，
+`jpeg_quality_range` 越小表示压缩越强；`jpeg_subsampling=2` 表示常见的 4:2:0 色度抽样。
+将 `type` 改回 `"bicubic"` 即可恢复原始行为。
+
+可以直接运行 `dataset.py` 预览指定样本的 LR/HR 对比。脚本会把 LR 放大到 HR 尺寸后并排
+保存，`--seed` 可用于观察同一 HR 的不同随机退化结果：
+
+```bash
+.venv/bin/python dataset.py \
+  --config config/train.local.json \
+  --split train \
+  --index 0 \
+  --seed 1234 \
+  --output results/dataset_preview/sample_0000.png
+```
+
+增加 `--show` 可在带桌面环境的机器上同时打开图片；`--resize-mode nearest` 更容易观察 LR
+的原始像素和压缩伪影，默认的 `bicubic` 更接近常规放大预览。
 
 所有图片按 RGB、`float32 [0, 1]` 读取。成对数据必须严格满足
 `HR 高宽 = LR 高宽 × 2`；训练时在 LR 空间随机裁剪，并对 HR 做对应裁剪。

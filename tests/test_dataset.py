@@ -1,11 +1,18 @@
 import tempfile
 import unittest
+import random
 from pathlib import Path
 
 import numpy as np
+import torch
 from PIL import Image
 
-from dataset import PairedSRDataset
+from dataset import (
+    PairedSRDataset,
+    bicubic_downsample,
+    load_rgb_tensor,
+    make_lr_hr_comparison,
+)
 
 
 def save_random_image(path, height, width, seed):
@@ -50,6 +57,75 @@ class DatasetTest(unittest.TestCase):
             item = dataset[0]
         self.assertEqual(tuple(item["input"].shape), (3, 16, 20))
         self.assertEqual(tuple(item["target"].shape), (3, 32, 40))
+
+    def test_realistic_degradation_generates_valid_aligned_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_random_image(root / "scene.png", 40, 48, 3)
+            dataset = PairedSRDataset({
+                "train_hr_dir": str(root),
+                "train_lr_dir": None,
+                "val_hr_dir": str(root),
+                "scale": 2,
+                "lr_patch_size": 16,
+                "augment": False,
+                "degradation": {
+                    "type": "realistic",
+                    "blur_probability": 1.0,
+                    "kernel_size": 7,
+                    "sigma_range": [1.2, 1.2],
+                    "resize_modes": ["bilinear"],
+                    "noise_probability": 1.0,
+                    "gaussian_noise_probability": 1.0,
+                    "gaussian_sigma_range": [5.0, 5.0],
+                    "jpeg_probability": 1.0,
+                    "jpeg_quality_range": [70, 70]
+                },
+            }, split="train")
+            random.seed(9)
+            np.random.seed(9)
+            item = dataset[0]
+
+        self.assertEqual(tuple(item["input"].shape), (3, 16, 16))
+        self.assertEqual(tuple(item["target"].shape), (3, 32, 32))
+        self.assertGreaterEqual(float(item["input"].min()), 0.0)
+        self.assertLessEqual(float(item["input"].max()), 1.0)
+        self.assertEqual(item["lr_path"], "<synthetic:realistic>")
+
+    def test_validation_stays_deterministic_bicubic_with_realistic_training(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_path = root / "scene.png"
+            save_random_image(image_path, 32, 40, 4)
+            dataset = PairedSRDataset({
+                "train_hr_dir": str(root),
+                "train_lr_dir": None,
+                "val_hr_dir": str(root),
+                "val_lr_dir": None,
+                "scale": 2,
+                "augment": False,
+                "degradation": {
+                    "type": "realistic",
+                    "noise_probability": 1.0,
+                    "gaussian_sigma_range": [25.0, 25.0]
+                },
+            }, split="val")
+            item = dataset[0]
+            expected = bicubic_downsample(load_rgb_tensor(image_path), scale=2)
+
+        self.assertTrue(torch.equal(item["input"], expected))
+        self.assertEqual(item["lr_path"], "<bicubic>")
+
+    def test_lr_hr_comparison_has_labeled_side_by_side_layout(self):
+        lr = torch.zeros(3, 8, 10)
+        hr = torch.ones(3, 16, 20)
+        comparison = make_lr_hr_comparison(lr, hr, resize_mode="nearest")
+
+        self.assertEqual(comparison.mode, "RGB")
+        self.assertEqual(comparison.size, (48, 48))
+        array = np.asarray(comparison)
+        self.assertTrue(np.all(array[32:, :20] == 0))
+        self.assertTrue(np.all(array[32:, 28:] == 255))
 
 
 if __name__ == "__main__":
