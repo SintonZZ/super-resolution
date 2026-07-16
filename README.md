@@ -158,6 +158,23 @@ NPU 性能测试建议先导出固定输入尺寸的 FP32 模型：
 
 准备 32–128 张具有代表性的 LR RGB 图片作为校准集，然后执行静态 PTQ：
 
+如果校准数据是一张大图，可以先按模型输入尺寸切成互不重叠的 PNG 小图：
+
+```bash
+.venv/bin/python quantization/split_calibration_image.py \
+  --input-image /path/to/large_lr.png \
+  --output-dir calib_data/spanf_x2_256 \
+  --tile-height 256 \
+  --tile-width 256 \
+  --max-tiles 128
+```
+
+切片按从左到右、从上到下的顺序生成，步长等于切片尺寸；不足一个完整切片的右侧和底部区域
+会被丢弃，因此所有输出都严格为指定尺寸且互不重叠。输出目录已有同名文件时默认拒绝覆盖，
+确认覆盖可增加 `--force`。
+
+然后执行静态 PTQ：
+
 ```bash
 .venv/bin/python quantization/onnx_ptq.py \
   --model-input checkpoints/spanf_x2_random_256.onnx \
