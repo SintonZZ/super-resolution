@@ -1,0 +1,32 @@
+{
+  "model": {
+    "weights_path": null,
+    "strict": true,
+    "type": "span",
+    "in_channels": 3,
+    "out_channels": 3,
+    "feature_channels": 48,
+    "upscale": 2,
+    "bias": true,
+    "img_range": 255.0,
+    "rgb_mean": [0.4488, 0.4371, 0.4040]
+  },
+  "dataset": {
+    "test_hr_dir": "/path/to/test/HR",
+    "test_lr_dir": null,
+    "scale": 2,
+    "filename_template": "{}",
+    "recursive": true,
+    "max_images": null
+  },
+  "test": {
+    "output_dir": "results/span_x2",
+    "device": "auto",
+    "num_workers": 4,
+    "crop_border": 2,
+    "tile_size": 0,
+    "tile_pad": 24,
+    "save_images": true,
+    "max_save_comparisons": 20
+  }
+}

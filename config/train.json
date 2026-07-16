@@ -1,0 +1,58 @@
+{
+  "training": {
+    "desc": "span_x2_finetune",
+    "total_epochs": 300,
+    "cycle_length": 300,
+    "max_lr": 0.0001,
+    "min_lr": 0.000001,
+    "head_lr_multiplier": 5.0,
+    "betas": [0.9, 0.99],
+    "weight_decay": 0.0,
+    "batch_size": 16,
+    "num_workers": 8,
+    "save_dir": "checkpoints/run_{timestamp}_{desc}",
+    "save_interval": 10,
+    "val_interval": 1,
+    "device": "auto",
+    "seed": 1234,
+    "resume": null,
+    "pretrained_4x_path": "pretrained/spanx4_ch48.pth",
+    "strict_pretrained_backbone": true,
+    "amp": true,
+    "clip_grad_norm": 0.0,
+    "drop_last": false,
+    "cudnn_benchmark": true
+  },
+  "dataset": {
+    "train_hr_dir": "/path/to/train/HR",
+    "train_lr_dir": null,
+    "val_hr_dir": "/path/to/val/HR",
+    "val_lr_dir": null,
+    "scale": 2,
+    "lr_patch_size": 64,
+    "filename_template": "{}",
+    "recursive": true,
+    "val_ratio": 0.05,
+    "seed": 1234,
+    "augment": true,
+    "max_images": null
+  },
+  "model": {
+    "type": "span",
+    "in_channels": 3,
+    "out_channels": 3,
+    "feature_channels": 48,
+    "upscale": 2,
+    "bias": true,
+    "img_range": 255.0,
+    "rgb_mean": [0.4488, 0.4371, 0.4040]
+  },
+  "loss": {
+    "type": "l1"
+  },
+  "validation": {
+    "crop_border": 2,
+    "tile_size": 0,
+    "tile_pad": 24
+  }
+}

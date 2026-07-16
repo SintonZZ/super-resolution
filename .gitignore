@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+.cache/
+.venv/
+data/
+checkpoints/
+results/
+pretrained/*.pth
+*.onnx
+config/*.local.json
