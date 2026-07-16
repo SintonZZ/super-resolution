@@ -3,3 +3,4 @@ numpy>=1.23.5,<2.0
 pillow>=9.5
 tqdm>=4.65
 onnx>=1.16
+onnxruntime>=1.19

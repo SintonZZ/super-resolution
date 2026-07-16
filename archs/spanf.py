@@ -1,14 +1,14 @@
-"""SPAN architecture adapted from the authors' Apache-2.0 implementation.
+"""Trainable SPAN-F architecture for efficient super-resolution.
 
-Official implementation:
-https://github.com/hongyuanyu/SPAN/blob/main/basicsr/archs/span_arch.py
+The network topology follows the XiaomiMM SPANF submission to the NTIRE 2025
+Efficient Super-Resolution challenge. Its submitted inference model contains
+already re-parameterized 3x3 convolutions; this implementation retains SPAN's
+multi-branch Conv3XC during training and fuses every branch for evaluation and
+export.
 
-Module names intentionally match the official implementation so that released
-x4 checkpoints can initialize the x2 model. Only ``upsampler.0`` changes shape
-when the scale changes from 4 to 2.
+Reference implementation:
+https://github.com/Amazingren/NTIRE2025_ESR/blob/main/models/team24_SPANF.py
 """
-
-from collections import OrderedDict
 
 import torch
 import torch.nn.functional as F
@@ -40,49 +40,12 @@ def conv_layer(in_channels, out_channels, kernel_size, bias=True):
     )
 
 
-def activation(act_type, inplace=True, neg_slope=0.05, n_prelu=1):
-    act_type = act_type.lower()
-    if act_type == "relu":
-        return nn.ReLU(inplace=inplace)
-    if act_type == "lrelu":
-        return nn.LeakyReLU(negative_slope=neg_slope, inplace=inplace)
-    if act_type == "prelu":
-        return nn.PReLU(num_parameters=n_prelu, init=neg_slope)
-    raise NotImplementedError(f"Activation layer is not implemented: {act_type}")
-
-
-def sequential(*args):
-    if len(args) == 1:
-        if isinstance(args[0], OrderedDict):
-            raise NotImplementedError("OrderedDict is not supported by sequential().")
-        return args[0]
-
-    modules = []
-    for module in args:
-        if isinstance(module, nn.Sequential):
-            modules.extend(module.children())
-        elif isinstance(module, nn.Module):
-            modules.append(module)
-    return nn.Sequential(*modules)
-
-
-def pixelshuffle_block(in_channels, out_channels, upscale_factor=2, kernel_size=3):
-    return sequential(
-        conv_layer(
-            in_channels,
-            out_channels * (upscale_factor ** 2),
-            kernel_size,
-        ),
-        nn.PixelShuffle(upscale_factor),
-    )
-
-
 class Conv3XC(nn.Module):
     """Training-time multi-branch convolution re-parameterized to one 3x3 conv."""
 
     def __init__(self, c_in, c_out, gain1=1, gain2=0, s=1, bias=True, relu=False):
         super().__init__()
-        del gain2  # Kept in the signature for checkpoint/code compatibility.
+        del gain2  # Kept in the signature for SPAN code compatibility.
 
         self.weight_concat = None
         self.bias_concat = None
@@ -174,99 +137,167 @@ class Conv3XC(nn.Module):
 
 
 class SPAB(nn.Module):
-    """Swift Parameter-free Attention Block."""
+    """SPAN-F block with attention only when input and output widths match."""
 
     def __init__(self, in_channels, mid_channels=None, out_channels=None, bias=False):
         super().__init__()
-        del bias  # The official SPAB uses bias-enabled Conv3XC layers.
+        del bias  # SPAN/SPAN-F use bias-enabled Conv3XC layers.
 
         mid_channels = in_channels if mid_channels is None else mid_channels
         out_channels = in_channels if out_channels is None else out_channels
-        self.in_channels = in_channels
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
 
         self.c1_r = Conv3XC(in_channels, mid_channels, gain1=2, s=1)
         self.c2_r = Conv3XC(mid_channels, mid_channels, gain1=2, s=1)
         self.c3_r = Conv3XC(mid_channels, out_channels, gain1=2, s=1)
         self.act1 = nn.SiLU(inplace=True) if hasattr(nn, "SiLU") else _SiLU()
-        self.act2 = activation("lrelu", neg_slope=0.1, inplace=True)
 
     def forward(self, x):
         out1 = self.c1_r(x)
-        out1_act = self.act1(out1)
-        out2 = self.c2_r(out1_act)
-        out2_act = self.act1(out2)
-        out3 = self.c3_r(out2_act)
+        out2 = self.c2_r(self.act1(out1))
+        out3 = self.c3_r(self.act1(out2))
+        if self.in_channels != self.out_channels:
+            return out3
+
         sim_att = torch.sigmoid(out3) - 0.5
-        out = (out3 + x) * sim_att
-        return out, out1, sim_att
+        return (out3 + x) * sim_att
 
 
-class SPAN(nn.Module):
-    """Swift Parameter-free Attention Network for efficient super-resolution."""
+class SPANF(nn.Module):
+    """Accelerated SPAN-F network adapted to configurable integer scale."""
 
     def __init__(
         self,
         num_in_ch=3,
         num_out_ch=3,
-        feature_channels=48,
+        feature_channels=32,
         upscale=2,
         bias=True,
-        img_range=255.0,
-        rgb_mean=(0.4488, 0.4371, 0.4040),
+        nearest_init=True,
     ):
         super().__init__()
-        if upscale < 1:
+        if int(upscale) < 1:
             raise ValueError(f"upscale must be positive, got {upscale}")
-        if len(rgb_mean) != num_in_ch:
-            raise ValueError("rgb_mean length must equal num_in_ch.")
+        if int(num_in_ch) < 1 or int(num_out_ch) < 1:
+            raise ValueError("Input and output channels must be positive.")
+        if int(feature_channels) < 1:
+            raise ValueError("feature_channels must be positive.")
 
         self.upscale = int(upscale)
-        self.img_range = float(img_range)
-        # Keep this as a plain tensor to preserve official state_dict keys.
-        self.mean = torch.tensor(rgb_mean).view(1, num_in_ch, 1, 1)
+        self.num_in_ch = int(num_in_ch)
+        self.num_out_ch = int(num_out_ch)
+        self.feature_channels = int(feature_channels)
 
-        self.conv_1 = Conv3XC(num_in_ch, feature_channels, gain1=2, s=1)
-        self.block_1 = SPAB(feature_channels, bias=bias)
-        self.block_2 = SPAB(feature_channels, bias=bias)
-        self.block_3 = SPAB(feature_channels, bias=bias)
-        self.block_4 = SPAB(feature_channels, bias=bias)
-        self.block_5 = SPAB(feature_channels, bias=bias)
-        self.block_6 = SPAB(feature_channels, bias=bias)
-        self.conv_cat = conv_layer(feature_channels * 4, feature_channels, 1, bias=True)
-        self.conv_2 = Conv3XC(feature_channels, feature_channels, gain1=2, s=1)
-        self.upsampler = pixelshuffle_block(
-            feature_channels,
-            num_out_ch,
-            upscale_factor=self.upscale,
+        scale_channels = self.num_in_ch * (self.upscale ** 2)
+        self.conv_near = nn.Conv2d(
+            self.num_in_ch,
+            scale_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            groups=self.num_in_ch,
+            bias=False,
         )
+        if nearest_init:
+            self._initialize_nearest_shortcut()
+
+        self.block_1 = SPAB(
+            self.num_in_ch,
+            self.feature_channels,
+            self.feature_channels,
+            bias=bias,
+        )
+        self.block_2 = SPAB(self.feature_channels, bias=bias)
+        self.block_3 = SPAB(self.feature_channels, bias=bias)
+        self.block_4 = SPAB(self.feature_channels, bias=bias)
+        self.block_5 = SPAB(self.feature_channels, bias=bias)
+
+        concat_channels = self.feature_channels * 2 + scale_channels
+        self.conv_cat = conv_layer(concat_channels, self.feature_channels, 1, bias=True)
+        self.conv_2 = Conv3XC(
+            self.feature_channels,
+            self.num_out_ch * (self.upscale ** 2),
+            gain1=2,
+            s=1,
+        )
+        self.depth_to_space = nn.PixelShuffle(self.upscale)
+
+    def _initialize_nearest_shortcut(self):
+        """Initialize the grouped convolution as depth-to-space nearest neighbor."""
+        with torch.no_grad():
+            self.conv_near.weight.zero_()
+            self.conv_near.weight[:, 0, 1, 1] = 1.0
 
     def load_state_dict(self, state_dict, strict=True, **kwargs):
         result = super().load_state_dict(state_dict, strict=strict, **kwargs)
-        # Branch weights may have changed, so the derived eval kernels are stale.
         for module in self.modules():
             if isinstance(module, Conv3XC) and not module.deploy:
                 module.eval_params_ready = False
         return result
 
+    def _convert_conv_near_to_dense(self):
+        """Replace the grouped shortcut with an exactly equivalent dense conv."""
+        source = self.conv_near
+        if source.groups == 1:
+            return
+        if source.in_channels % source.groups != 0:
+            raise ValueError("conv_near input channels must be divisible by groups.")
+        if source.out_channels % source.groups != 0:
+            raise ValueError("conv_near output channels must be divisible by groups.")
+
+        dense = nn.Conv2d(
+            source.in_channels,
+            source.out_channels,
+            kernel_size=source.kernel_size,
+            stride=source.stride,
+            padding=source.padding,
+            dilation=source.dilation,
+            groups=1,
+            bias=source.bias is not None,
+            padding_mode=source.padding_mode,
+        ).to(device=source.weight.device, dtype=source.weight.dtype)
+
+        inputs_per_group = source.in_channels // source.groups
+        outputs_per_group = source.out_channels // source.groups
+        with torch.no_grad():
+            dense.weight.zero_()
+            for group_index in range(source.groups):
+                input_start = group_index * inputs_per_group
+                input_end = input_start + inputs_per_group
+                output_start = group_index * outputs_per_group
+                output_end = output_start + outputs_per_group
+                dense.weight[output_start:output_end, input_start:input_end].copy_(
+                    source.weight[output_start:output_end]
+                )
+            if source.bias is not None:
+                dense.bias.copy_(source.bias)
+
+        dense.weight.requires_grad = source.weight.requires_grad
+        if dense.bias is not None:
+            dense.bias.requires_grad = source.bias.requires_grad
+        dense.train(source.training)
+        self.conv_near = dense
+
     def switch_to_deploy(self):
         for module in self.modules():
             if isinstance(module, Conv3XC):
                 module.switch_to_deploy()
+        self._convert_conv_near_to_dense()
         self.eval()
         return self
 
     def forward(self, x):
-        mean = self.mean.to(device=x.device, dtype=x.dtype)
-        x = (x - mean) * self.img_range
+        out_feature = self.conv_near(x)
+        out_b1 = self.block_1(x)
+        out_b2 = self.block_2(out_b1)
+        out_b3 = self.block_3(out_b2)
+        out_b4 = self.block_4(out_b3)
+        out_b5 = self.block_5(out_b4)
 
-        out_feature = self.conv_1(x)
-        out_b1, _, _ = self.block_1(out_feature)
-        out_b2, _, _ = self.block_2(out_b1)
-        out_b3, _, _ = self.block_3(out_b2)
-        out_b4, _, _ = self.block_4(out_b3)
-        out_b5, _, _ = self.block_5(out_b4)
-        out_b6, out_b5_2, _ = self.block_6(out_b5)
-        out_b6 = self.conv_2(out_b6)
+        out = self.conv_cat(torch.cat([out_feature, out_b5, out_b1], dim=1))
+        out = self.conv_2(out)
+        return self.depth_to_space(out)
 
-        out = self.conv_cat(torch.cat([out_feature, out_b6, out_b1, out_b5_2], dim=1))
-        return self.upsampler(out)
+
+__all__ = ["Conv3XC", "SPAB", "SPANF"]

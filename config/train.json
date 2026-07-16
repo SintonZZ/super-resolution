@@ -1,11 +1,10 @@
 {
   "training": {
-    "desc": "span_x2_finetune",
+    "desc": "spanf_x2_scratch",
     "total_epochs": 300,
     "cycle_length": 300,
-    "max_lr": 0.0001,
+    "max_lr": 0.0005,
     "min_lr": 0.000001,
-    "head_lr_multiplier": 5.0,
     "betas": [0.9, 0.99],
     "weight_decay": 0.0,
     "batch_size": 16,
@@ -16,8 +15,6 @@
     "device": "auto",
     "seed": 1234,
     "resume": null,
-    "pretrained_4x_path": "pretrained/spanx4_ch48.pth",
-    "strict_pretrained_backbone": true,
     "amp": true,
     "clip_grad_norm": 0.0,
     "drop_last": false,
@@ -38,14 +35,13 @@
     "max_images": null
   },
   "model": {
-    "type": "span",
+    "type": "spanf",
     "in_channels": 3,
     "out_channels": 3,
-    "feature_channels": 48,
+    "feature_channels": 32,
     "upscale": 2,
     "bias": true,
-    "img_range": 255.0,
-    "rgb_mean": [0.4488, 0.4371, 0.4040]
+    "nearest_init": true
   },
   "loss": {
     "type": "l1"

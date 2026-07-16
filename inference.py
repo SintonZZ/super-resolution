@@ -4,7 +4,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from archs import build_span
+from archs import build_model
 from dataset import load_rgb_tensor
 from util import (
     clean_state_dict,
@@ -26,7 +26,7 @@ def load_model(weights_path, device):
     if int(model_config.get("upscale", 2)) != 2:
         raise ValueError("Checkpoint model.upscale is not 2.")
 
-    model = build_span(model_config).to(device)
+    model = build_model(model_config).to(device)
     state_dict, _ = extract_state_dict(checkpoint)
     model.load_state_dict(clean_state_dict(state_dict), strict=True)
     model.switch_to_deploy()
@@ -34,7 +34,7 @@ def load_model(weights_path, device):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Upscale one image or a directory with SPAN x2.")
+    parser = argparse.ArgumentParser(description="Upscale one image or directory with SPAN-F x2.")
     parser.add_argument("--weights", required=True)
     parser.add_argument("--input", required=True, help="Input image or directory.")
     parser.add_argument("--output-dir", default="results/inference")

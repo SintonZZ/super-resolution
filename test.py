@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from archs import build_span
+from archs import build_model
 from dataset import PairedSRDataset
 from util import (
     AverageMeter,
@@ -43,7 +43,7 @@ def load_model(weights_path, fallback_model_config, device, strict=True):
     if not model_config:
         raise ValueError("Model config is missing from both checkpoint and test config.")
 
-    model = build_span(model_config).to(device)
+    model = build_model(model_config).to(device)
     state_dict, _ = extract_state_dict(checkpoint)
     model.load_state_dict(clean_state_dict(state_dict), strict=strict)
     model.switch_to_deploy()
@@ -106,7 +106,7 @@ def run_test(model, loader, device, config, model_config):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate a fine-tuned SPAN x2 checkpoint.")
+    parser = argparse.ArgumentParser(description="Evaluate a trained SPAN-F x2 checkpoint.")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--weights", default=None)
     parser.add_argument("--test-hr-dir", default=None)

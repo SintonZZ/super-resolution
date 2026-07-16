@@ -10,7 +10,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from archs import build_span
+from archs import build_model
 from dataset import PairedSRDataset
 from util import (
     AverageMeter,
@@ -18,7 +18,6 @@ from util import (
     count_parameters,
     forward_tiled,
     get_lr,
-    load_pretrained_span_backbone,
     load_torch,
     resolve_auto_device,
     save_json,
@@ -44,7 +43,7 @@ def load_config(config_path):
 def expand_save_dir(config):
     training = config["training"]
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    desc = training.get("desc", "span_x2_finetune")
+    desc = training.get("desc", "spanf_x2_train")
     training["save_dir"] = training["save_dir"].format(timestamp=timestamp, desc=desc)
     training["device"] = resolve_auto_device(training.get("device", "auto"))
 
@@ -61,27 +60,8 @@ def build_loss(loss_type):
 
 def build_optimizer(model, training_config):
     base_lr = float(training_config["max_lr"])
-    head_multiplier = float(training_config.get("head_lr_multiplier", 1.0))
-    backbone_parameters = []
-    head_parameters = []
-    for name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        if name.startswith("upsampler."):
-            head_parameters.append(parameter)
-        else:
-            backbone_parameters.append(parameter)
-
-    parameter_groups = [
-        {"params": backbone_parameters, "lr": base_lr, "lr_scale": 1.0},
-        {
-            "params": head_parameters,
-            "lr": base_lr * head_multiplier,
-            "lr_scale": head_multiplier,
-        },
-    ]
     return optim.Adam(
-        parameter_groups,
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
         lr=base_lr,
         betas=tuple(training_config.get("betas", (0.9, 0.99))),
         weight_decay=float(training_config.get("weight_decay", 0.0)),
@@ -96,7 +76,7 @@ def set_epoch_lr(optimizer, epoch, training_config):
         min_lr=float(training_config["min_lr"]),
     )
     for group in optimizer.param_groups:
-        group["lr"] = base_lr * float(group.get("lr_scale", 1.0))
+        group["lr"] = base_lr
     return base_lr
 
 
@@ -187,7 +167,7 @@ def run_one_epoch(model, loader, criterion, optimizer, scaler, use_amp, device, 
 
     metrics = {"loss": loss_meter.avg, "psnr": psnr_meter.avg, "lr": base_lr}
     logger.info(
-        "Train epoch %d | loss %.6f | RGB PSNR %.3f | backbone lr %.3e",
+        "Train epoch %d | loss %.6f | RGB PSNR %.3f | lr %.3e",
         epoch + 1,
         metrics["loss"],
         metrics["psnr"],
@@ -235,13 +215,12 @@ def validate(model, loader, criterion, device, config, epoch, logger):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Fine-tune official SPAN x4 weights for x2 SR.")
+    parser = argparse.ArgumentParser(description="Train SPAN-F x2 for single-image SR.")
     parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
     parser.add_argument("--train-hr-dir", default=None)
     parser.add_argument("--train-lr-dir", default=None)
     parser.add_argument("--val-hr-dir", default=None)
     parser.add_argument("--val-lr-dir", default=None)
-    parser.add_argument("--pretrained-4x", default=None)
     parser.add_argument("--resume", default=None)
     parser.add_argument("--save-dir", default=None)
     parser.add_argument("--epochs", type=int, default=None)
@@ -267,7 +246,6 @@ def apply_overrides(config, args):
             config["dataset"][key] = value
 
     training_updates = {
-        "pretrained_4x_path": args.pretrained_4x,
         "resume": args.resume,
         "save_dir": args.save_dir,
         "total_epochs": args.epochs,
@@ -287,7 +265,7 @@ def main():
     expand_save_dir(config)
 
     if int(config["model"].get("upscale", 2)) != 2:
-        raise ValueError("This fine-tuning project expects model.upscale=2.")
+        raise ValueError("This training project expects model.upscale=2.")
     if int(config["dataset"].get("scale", 2)) != 2:
         raise ValueError("dataset.scale must be 2.")
 
@@ -296,7 +274,7 @@ def main():
     logger = setup_logger(save_dir)
     save_json(config, Path(save_dir) / "config.json")
     logger.info("=" * 60)
-    logger.info("Starting SPAN x2 fine-tuning")
+    logger.info("Starting SPAN-F x2 training")
     logger.info("=" * 60)
     logger.info("Configuration:\n%s", json.dumps(config, indent=4, ensure_ascii=False))
 
@@ -328,33 +306,17 @@ def main():
     )
     logger.info("Datasets loaded: train=%d, val=%d", len(train_dataset), len(val_dataset))
 
-    model = build_span(config["model"]).to(device)
-    logger.info("Model parameters: %.3f M", count_parameters(model) / 1e6)
+    model = build_model(config["model"]).to(device)
+    trainable_parameters = sum(
+        parameter.numel() for parameter in model.parameters() if parameter.requires_grad
+    )
+    logger.info(
+        "Model parameters: %.3f M registered, %.3f M trainable",
+        count_parameters(model) / 1e6,
+        trainable_parameters / 1e6,
+    )
 
     resume_path = training.get("resume")
-    pretrained_path = training.get("pretrained_4x_path")
-    if not resume_path and pretrained_path:
-        report = load_pretrained_span_backbone(
-            model,
-            pretrained_path,
-            map_location=device,
-            strict_backbone=bool(training.get("strict_pretrained_backbone", True)),
-        )
-        logger.info(
-            "Loaded pretrained checkpoint state '%s': scale=%s, loaded=%d, "
-            "shape_mismatches=%s",
-            report["state_key"],
-            report["checkpoint_scale"],
-            report["loaded_count"],
-            report["shape_mismatches"],
-        )
-        if report["checkpoint_scale"] not in (None, 4):
-            logger.warning(
-                "The checkpoint head appears to be x%s rather than x4.",
-                report["checkpoint_scale"],
-            )
-    elif not resume_path:
-        logger.warning("No pretrained_4x_path configured; training SPAN x2 from scratch.")
 
     criterion = build_loss(config["loss"].get("type", "l1")).to(device)
     optimizer = build_optimizer(model, training)

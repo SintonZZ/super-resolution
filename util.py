@@ -13,7 +13,7 @@ from PIL import Image
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
 
 
-def setup_logger(save_dir, name="SPANx2"):
+def setup_logger(save_dir, name="SPANFx2"):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger(name)
@@ -128,81 +128,6 @@ def clean_state_dict(state_dict):
                     changed = True
         cleaned[key] = value
     return cleaned
-
-
-def infer_span_scale(state_dict, out_channels=3):
-    weight = state_dict.get("upsampler.0.weight")
-    if weight is None or weight.ndim != 4:
-        return None
-    ratio = int(weight.shape[0]) / int(out_channels)
-    scale = int(round(math.sqrt(ratio)))
-    return scale if scale * scale == ratio else None
-
-
-def load_pretrained_span_backbone(model, weight_path, map_location="cpu", strict_backbone=True):
-    """Load all shape-compatible official SPAN weights and replace the SR head.
-
-    A x4 checkpoint has 3 * 4^2 output channels in ``upsampler.0`` while the
-    x2 model has 3 * 2^2, so that convolution is intentionally not loaded.
-    """
-    weight_path = Path(weight_path).expanduser()
-    if not weight_path.exists():
-        raise FileNotFoundError(f"Pretrained checkpoint not found: {weight_path}")
-
-    checkpoint = load_torch(weight_path, map_location=map_location)
-    raw_state_dict, state_key = extract_state_dict(checkpoint)
-    state_dict = clean_state_dict(raw_state_dict)
-    model_state = model.state_dict()
-
-    loaded = {}
-    unexpected = []
-    shape_mismatches = []
-    for key, value in state_dict.items():
-        if key not in model_state:
-            unexpected.append(key)
-            continue
-        if tuple(value.shape) != tuple(model_state[key].shape):
-            shape_mismatches.append({
-                "key": key,
-                "checkpoint": list(value.shape),
-                "model": list(model_state[key].shape),
-            })
-            continue
-        loaded[key] = value
-
-    if not loaded:
-        raise ValueError("No compatible SPAN parameters were found in the checkpoint.")
-
-    model.load_state_dict(loaded, strict=False)
-    missing = [key for key in model_state if key not in loaded]
-    allowed_missing_prefixes = ("upsampler.",)
-    derived_key_marker = ".eval_conv."
-    bad_missing = [
-        key for key in missing
-        if not key.startswith(allowed_missing_prefixes) and derived_key_marker not in key
-    ]
-    bad_mismatches = [
-        item for item in shape_mismatches
-        if not item["key"].startswith(allowed_missing_prefixes)
-        and derived_key_marker not in item["key"]
-    ]
-    if strict_backbone and (bad_missing or bad_mismatches):
-        details = []
-        if bad_missing:
-            details.append(f"missing backbone keys: {bad_missing[:8]}")
-        if bad_mismatches:
-            details.append(f"backbone shape mismatches: {bad_mismatches[:4]}")
-        raise RuntimeError("Pretrained checkpoint is not compatible with SPAN: " + "; ".join(details))
-
-    return {
-        "checkpoint_path": os.fspath(weight_path),
-        "state_key": state_key,
-        "checkpoint_scale": infer_span_scale(state_dict),
-        "loaded_count": len(loaded),
-        "missing": missing,
-        "unexpected": unexpected,
-        "shape_mismatches": shape_mismatches,
-    }
 
 
 def load_model_weights(model, weight_path, device="cpu", strict=True):

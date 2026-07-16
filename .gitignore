@@ -5,6 +5,6 @@ __pycache__/
 data/
 checkpoints/
 results/
-pretrained/*.pth
+calib_data/
 *.onnx
 config/*.local.json

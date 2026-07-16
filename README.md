@@ -1,26 +1,23 @@
-# SPAN ×2 超分辨率微调
+# SPAN-F ×2 超分辨率训练
 
-这个项目用于把官方 SPAN ×4 模型迁移到 ×2 单图超分辨率任务。
-模型实现基于论文作者的 [官方 SPAN 代码](https://github.com/hongyuanyu/SPAN)，层名与官方
-`span_arch.py` 保持一致，以便直接读取官方 checkpoint。
+这个项目用于从头训练 SPAN-F ×2 单图超分辨率模型。网络拓扑基于 XiaomiMM 在
+NTIRE 2025 Efficient Super-Resolution Challenge 提交的
+[SPANF](https://github.com/Amazingren/NTIRE2025_ESR/blob/main/models/team24_SPANF.py)，
+并保留 SPAN 的训练态 Conv3XC 多分支重参数化能力。
 
-## ×4 权重如何迁移到 ×2
+## 模型结构
 
-SPAN 的放大倍率只影响最后的 PixelShuffle head：
+相较原始 CH48 SPAN，SPAN-F 默认采用：
 
-```text
-x4: upsampler.0 输出通道 = 3 * 4^2 = 48
-x2: upsampler.0 输出通道 = 3 * 2^2 = 12
-```
+- 32 个特征通道和 5 个 SPAB；
+- 一个 nearest-neighbor-like 分组卷积输入捷径；
+- `shortcut / block_5 / block_1` 三路特征聚合；
+- 直接生成 `3 × scale²` 通道并通过 PixelShuffle 放大；
+- 推理和 ONNX 导出前，将每个 Conv3XC 融合成一个 3×3 卷积；
+- 部署时将输入捷径无损转换成 `groups=1` 的普通卷积，导出图不包含分组卷积。
 
-因此 `upsampler.0.weight` 和 `upsampler.0.bias` 无法直接复用。训练脚本会：
-
-1. 从官方常见的 `params_ema`、`params` 或 raw state dict 中读取权重；
-2. 加载所有名字和 shape 均匹配的 SPAN 主干参数；
-3. 保留随机初始化的 ×2 `upsampler.0`；
-4. 严格检查是否还有 head 以外的主干缺失或 shape 不匹配。
-
-默认给新 head 使用主干 5 倍学习率，可在 `training.head_lr_multiplier` 中修改。
+当前实现固定用于 ×2 训练。它不加载原始 SPAN ×4 或 SPAN-F ×4 权重；`--resume` 只接受
+本项目 `train.py` 生成的 SPAN-F ×2 checkpoint。
 
 ## 环境
 
@@ -40,7 +37,7 @@ uv pip install --python .venv/bin/python numpy pillow tqdm onnx
 
 ## 数据格式
 
-支持两种训练数据。
+支持成对 LR/HR 数据和只有 HR 的数据。
 
 ### 成对 LR/HR
 
@@ -51,7 +48,7 @@ dataset/val/HR/0801.png
 dataset/val/LR/0801x2.png
 ```
 
-配置为：
+对应配置：
 
 ```json
 {
@@ -76,20 +73,13 @@ dataset/val/LR/0801x2.png
 
 ## 训练
 
-先复制一份本机配置：
+先复制一份本机配置并填写数据路径：
 
 ```bash
 cp config/train.json config/train.local.json
 ```
 
-仓库默认使用已经下载到 `pretrained/spanx4_ch48.pth` 的官方 ×4 CH48 权重；如需使用其他
-checkpoint，可在 `config/train.local.json` 中修改：
-
-```json
-"pretrained_4x_path": "/path/to/official_span_x4.pth"
-```
-
-启动训练：
+从头训练：
 
 ```bash
 .venv/bin/python train.py --config config/train.local.json
@@ -103,13 +93,12 @@ checkpoint，可在 `config/train.local.json` 中修改：
   --train-hr-dir /path/to/train/HR \
   --train-lr-dir /path/to/train/LR \
   --val-hr-dir /path/to/val/HR \
-  --val-lr-dir /path/to/val/LR \
-  --pretrained-4x /path/to/span_x4.pth
+  --val-lr-dir /path/to/val/LR
 ```
 
 输出目录包含 `config.json`、`train.log`、`latest_model.pth`、`best_model.pth` 和周期 checkpoint。
-恢复中断训练应使用 `--resume`，它会严格恢复 ×2 模型、optimizer、epoch 和 AMP scaler；不要把
-官方 ×4 权重传给 `--resume`。
+恢复中断训练使用 `--resume /path/to/latest_model.pth`，它会严格恢复模型、optimizer、epoch 和
+AMP scaler。
 
 ## 测试与推理
 
@@ -135,15 +124,54 @@ checkpoint，可在 `config/train.local.json` 中修改：
 
 ## ONNX 导出
 
-导出前会把每个训练态 `Conv3XC` 重参数化成单个 3×3 卷积：
+导出前会自动完成 Conv3XC 重参数化：
 
 ```bash
 .venv/bin/python export_onnx.py \
   --weights checkpoints/run_xxx/best_model.pth \
-  --output checkpoints/run_xxx/span_x2.onnx
+  --output checkpoints/run_xxx/spanf_x2.onnx
 ```
 
 默认导出动态 NCHW；增加 `--static-shape --input-height 256 --input-width 256` 可导出固定尺寸。
+
+如果尚未训练、只想提前验证 NPU 编译兼容性和推理效率，可以不传 `--weights`。此时脚本会从
+`config/train.json` 的 `model` 配置构建随机初始化模型，模型结构与训练模型相同，但输出图像
+没有质量意义：
+
+```bash
+.venv/bin/python export_onnx.py \
+  --output checkpoints/spanf_x2_random_256.onnx \
+  --static-shape --input-height 256 --input-width 256
+```
+
+可以通过 `--config /path/to/train.json` 指定其他模型配置，通过 `--seed` 固定随机参数。
+
+### ONNX Runtime PTQ
+
+NPU 性能测试建议先导出固定输入尺寸的 FP32 模型：
+
+```bash
+.venv/bin/python export_onnx.py \
+  --output checkpoints/spanf_x2_random_256.onnx \
+  --static-shape --input-height 256 --input-width 256
+```
+
+准备 32–128 张具有代表性的 LR RGB 图片作为校准集，然后执行静态 PTQ：
+
+```bash
+.venv/bin/python quantization/onnx_ptq.py \
+  --model-input checkpoints/spanf_x2_random_256.onnx \
+  --model-output checkpoints/spanf_x2_random_256_ptq.onnx \
+  --calib-dir /path/to/calibration/LR \
+  --max-samples 128 \
+  --force
+```
+
+脚本默认使用 MinMax 校准、QDQ 格式、激活和权重均为 uint8 非对称逐 tensor 量化，并且只量化
+Conv。校准目录也支持 `[1,3,H,W]` 或 `[3,H,W]`、数值范围为 `[0,1]` 的 `.npy` 文件。
+动态图可通过 `--calib-height` 和 `--calib-width` 指定校准尺寸，但 NPU 性能测试通常应使用与
+实际部署一致的固定尺寸模型。量化前会拒绝包含分组卷积或 SiLU/Swish 节点的 ONNX，量化完成后
+会运行 `onnx.checker`。
 
 ## 本地验证
 
@@ -151,4 +179,5 @@ checkpoint，可在 `config/train.local.json` 中修改：
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖 ×2 输出尺寸、Conv3XC 重参数化等价性、×4 主干权重迁移和 tiled inference 拼接。
+测试覆盖 SPAN-F ×2 拓扑、输出尺寸、nearest shortcut、Conv3XC/整网重参数化等价性、
+tiled inference 拼接和数据集配对。
