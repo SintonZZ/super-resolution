@@ -161,6 +161,9 @@ AMP scaler。
   --test-lr-dir /path/to/test/LR
 ```
 
+测试结果中的 `comparisons` 目录会保存两栏对比图：左侧为 LR 双线性放大结果，右侧为模型预测的
+SR 图像；真实 HR 仅用于计算 PSNR。
+
 对任意图片或目录做 ×2 推理：
 
 ```bash

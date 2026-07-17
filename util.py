@@ -7,7 +7,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
+import torch.nn.functional as F
+from PIL import Image, ImageDraw
 
 
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp")
@@ -219,18 +220,49 @@ def save_image(tensor, path):
     Image.fromarray(tensor_to_uint8_image(tensor)).save(path)
 
 
-def save_sr_comparison(input_tensor, output_tensor, target_tensor, path):
-    input_image = Image.fromarray(tensor_to_uint8_image(input_tensor))
-    output_image = tensor_to_uint8_image(output_tensor)
-    target_image = tensor_to_uint8_image(target_tensor)
-    input_image = input_image.resize(
-        (output_image.shape[1], output_image.shape[0]),
-        resample=Image.Resampling.BICUBIC,
+def save_sr_comparison(input_tensor, output_tensor, path):
+    """Save LR bilinear upsampling and model SR output side by side."""
+    output_height, output_width = output_tensor.shape[-2:]
+    bilinear = F.interpolate(
+        input_tensor,
+        size=(output_height, output_width),
+        mode="bilinear",
+        align_corners=False,
     )
-    canvas = np.concatenate([np.asarray(input_image), output_image, target_image], axis=1)
+    bilinear_image = tensor_to_uint8_image(bilinear)
+    output_image = tensor_to_uint8_image(output_tensor)
+    if bilinear_image.shape != output_image.shape:
+        raise ValueError(
+            "Comparison shape mismatch after bilinear interpolation: "
+            f"{bilinear_image.shape} vs {output_image.shape}."
+        )
+
+    header_height = 32
+    gap = 8
+    canvas = Image.new(
+        "RGB",
+        (output_width * 2 + gap, output_height + header_height),
+        color=(24, 24, 24),
+    )
+    canvas.paste(Image.fromarray(bilinear_image), (0, header_height))
+    canvas.paste(Image.fromarray(output_image), (output_width + gap, header_height))
+
+    input_height, input_width = input_tensor.shape[-2:]
+    draw = ImageDraw.Draw(canvas)
+    draw.text(
+        (8, 9),
+        f"LR {input_width}x{input_height} (bilinear)",
+        fill=(255, 255, 255),
+    )
+    draw.text(
+        (output_width + gap + 8, 9),
+        f"Model SR {output_width}x{output_height}",
+        fill=(255, 255, 255),
+    )
+
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(canvas).save(path)
+    canvas.save(path)
 
 
 def list_image_files(root, recursive=True):

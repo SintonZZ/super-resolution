@@ -91,8 +91,7 @@ def run_test(model, loader, device, config, model_config):
             save_sr_comparison(
                 inputs,
                 outputs,
-                targets,
-                comparison_dir / f"{name}_input_output_target.png",
+                comparison_dir / f"{name}_bilinear_vs_model.png",
             )
 
     metrics = {
