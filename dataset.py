@@ -42,25 +42,43 @@ def bicubic_downsample(hr, scale):
     return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1)))
 
 
-def _numeric_range(config, key, default, minimum=None, maximum=None):
+def _config_key(path, key):
+    return f"{path}.{key}"
+
+
+def _numeric_range(config, key, default, minimum=None, maximum=None, path="degradation"):
+    config_key = _config_key(path, key)
     values = config.get(key, default)
     if not isinstance(values, (list, tuple)) or len(values) != 2:
-        raise ValueError(f"degradation.{key} must contain exactly two numbers.")
+        raise ValueError(f"{config_key} must contain exactly two numbers.")
     low, high = float(values[0]), float(values[1])
     if low > high:
-        raise ValueError(f"degradation.{key} must be ordered low-to-high, got {values}.")
+        raise ValueError(f"{config_key} must be ordered low-to-high, got {values}.")
     if minimum is not None and low < minimum:
-        raise ValueError(f"degradation.{key} must be >= {minimum}, got {values}.")
+        raise ValueError(f"{config_key} must be >= {minimum}, got {values}.")
     if maximum is not None and high > maximum:
-        raise ValueError(f"degradation.{key} must be <= {maximum}, got {values}.")
+        raise ValueError(f"{config_key} must be <= {maximum}, got {values}.")
     return low, high
 
 
-def _probability(config, key, default):
+def _probability(config, key, default, path="degradation"):
     value = float(config.get(key, default))
     if not 0.0 <= value <= 1.0:
-        raise ValueError(f"degradation.{key} must be in [0, 1], got {value}.")
+        raise ValueError(f"{_config_key(path, key)} must be in [0, 1], got {value}.")
     return value
+
+
+def _weights(config, key, default, expected_size, path="degradation"):
+    config_key = _config_key(path, key)
+    values = config.get(key, default)
+    if not isinstance(values, (list, tuple)) or len(values) != expected_size:
+        raise ValueError(f"{config_key} must contain exactly {expected_size} numbers.")
+    values = [float(value) for value in values]
+    if any(value < 0 for value in values):
+        raise ValueError(f"{config_key} cannot contain negative values.")
+    if sum(values) <= 0:
+        raise ValueError(f"{config_key} must have a positive sum.")
+    return values
 
 
 def _anisotropic_gaussian_kernel(kernel_size, sigma_x, sigma_y, rotation):
@@ -81,6 +99,11 @@ def _filter_rgb_tensor(image, kernel):
     kernel_tensor = image.new_tensor(kernel).view(1, 1, *kernel.shape)
     kernel_tensor = kernel_tensor.repeat(image.shape[0], 1, 1, 1)
     padding = kernel.shape[0] // 2
+    if image.shape[-2] <= padding or image.shape[-1] <= padding:
+        raise ValueError(
+            f"Image shape {tuple(image.shape[-2:])} is too small for "
+            f"degradation kernel size {kernel.shape[0]}."
+        )
     padded = F.pad(image.unsqueeze(0), (padding,) * 4, mode="reflect")
     return F.conv2d(padded, kernel_tensor, groups=image.shape[0]).squeeze(0)
 
@@ -144,72 +167,352 @@ def _jpeg_compress(image, quality, subsampling):
     return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1)))
 
 
-class RealisticDegradation:
-    """Single-stage blur, resize, noise and JPEG degradation for synthetic LR."""
+def _windowed_sinc_kernel(kernel_size, cutoff):
+    """Build a normalized separable low-pass sinc kernel with a Hamming window."""
+    radius = kernel_size // 2
+    coordinates = np.arange(-radius, radius + 1, dtype=np.float64)
+    kernel_1d = cutoff * np.sinc(cutoff * coordinates)
+    kernel_1d *= np.hamming(kernel_size)
+    kernel = np.outer(kernel_1d, kernel_1d)
+    kernel /= kernel.sum()
+    return kernel.astype(np.float32)
 
-    def __init__(self, config):
-        self.blur_probability = _probability(config, "blur_probability", 0.8)
-        self.isotropic_probability = _probability(config, "isotropic_probability", 0.5)
-        self.sigma_range = _numeric_range(config, "sigma_range", (0.2, 2.0), minimum=0.01)
+
+class _DegradationStage:
+    """One blur/resize/noise/JPEG stage in the high-order pipeline."""
+
+    _RESIZE_DIRECTIONS = ("down", "up", "keep")
+
+    def __init__(self, config, defaults, path):
+        self.blur_probability = _probability(
+            config,
+            "blur_probability",
+            defaults["blur_probability"],
+            path,
+        )
+        self.kernel_size = int(config.get("kernel_size", defaults["kernel_size"]))
+        if self.kernel_size < 3 or self.kernel_size % 2 == 0:
+            raise ValueError(f"{path}.kernel_size must be an odd integer >= 3.")
+        self.isotropic_probability = _probability(
+            config,
+            "isotropic_probability",
+            defaults["isotropic_probability"],
+            path,
+        )
+        self.sigma_range = _numeric_range(
+            config,
+            "sigma_range",
+            defaults["sigma_range"],
+            minimum=0.01,
+            path=path,
+        )
         self.rotation_range = _numeric_range(
             config,
             "rotation_range",
-            (-math.pi, math.pi),
+            defaults["rotation_range"],
+            path=path,
         )
-        self.noise_probability = _probability(config, "noise_probability", 0.8)
+
+        self.resize_scale_range = _numeric_range(
+            config,
+            "resize_scale_range",
+            defaults["resize_scale_range"],
+            minimum=0.01,
+            path=path,
+        )
+        self.resize_direction_probabilities = _weights(
+            config,
+            "resize_direction_probabilities",
+            defaults["resize_direction_probabilities"],
+            len(self._RESIZE_DIRECTIONS),
+            path,
+        )
+        low_scale, high_scale = self.resize_scale_range
+        if self.resize_direction_probabilities[0] > 0 and low_scale >= 1.0:
+            raise ValueError(
+                f"{path}.resize_scale_range must include values below 1 when downsampling "
+                "has non-zero probability."
+            )
+        if self.resize_direction_probabilities[1] > 0 and high_scale <= 1.0:
+            raise ValueError(
+                f"{path}.resize_scale_range must include values above 1 when upsampling "
+                "has non-zero probability."
+            )
+
+        self.resize_modes = list(config.get("resize_modes", defaults["resize_modes"]))
+        if not self.resize_modes:
+            raise ValueError(f"{path}.resize_modes must not be empty.")
+        for mode in self.resize_modes:
+            _resize_tensor(torch.zeros(3, 2, 2), (1, 1), mode)
+        default_mode_probabilities = (
+            defaults["resize_mode_probabilities"]
+            if "resize_modes" not in config
+            else [1.0] * len(self.resize_modes)
+        )
+        self.resize_mode_probabilities = _weights(
+            config,
+            "resize_mode_probabilities",
+            default_mode_probabilities,
+            len(self.resize_modes),
+            path,
+        )
+
+        self.noise_probability = _probability(
+            config,
+            "noise_probability",
+            defaults["noise_probability"],
+            path,
+        )
         self.gaussian_noise_probability = _probability(
             config,
             "gaussian_noise_probability",
-            0.6,
+            defaults["gaussian_noise_probability"],
+            path,
         )
-        self.gray_noise_probability = _probability(config, "gray_noise_probability", 0.2)
+        self.gray_noise_probability = _probability(
+            config,
+            "gray_noise_probability",
+            defaults["gray_noise_probability"],
+            path,
+        )
         self.gaussian_sigma_range = _numeric_range(
             config,
             "gaussian_sigma_range",
-            (1.0, 10.0),
+            defaults["gaussian_sigma_range"],
             minimum=0.0,
+            path=path,
         )
         self.poisson_peak_range = _numeric_range(
             config,
             "poisson_peak_range",
-            (100.0, 1000.0),
+            defaults["poisson_peak_range"],
             minimum=1.0,
+            path=path,
         )
-        self.jpeg_probability = _probability(config, "jpeg_probability", 0.8)
+
+        self.jpeg_probability = _probability(
+            config,
+            "jpeg_probability",
+            defaults["jpeg_probability"],
+            path,
+        )
         self.jpeg_quality_range = _numeric_range(
             config,
             "jpeg_quality_range",
-            (60, 95),
+            defaults["jpeg_quality_range"],
             minimum=1,
             maximum=100,
+            path=path,
         )
-        self.jpeg_subsampling = int(config.get("jpeg_subsampling", 2))
+        self.jpeg_subsampling = int(
+            config.get("jpeg_subsampling", defaults["jpeg_subsampling"])
+        )
         if self.jpeg_subsampling not in (0, 1, 2):
-            raise ValueError("degradation.jpeg_subsampling must be 0, 1, or 2.")
+            raise ValueError(f"{path}.jpeg_subsampling must be 0, 1, or 2.")
 
-        self.kernel_size = int(config.get("kernel_size", 15))
-        if self.kernel_size < 3 or self.kernel_size % 2 == 0:
-            raise ValueError("degradation.kernel_size must be an odd integer >= 3.")
-
-        self.resize_modes = list(config.get("resize_modes", ("bicubic", "bilinear", "lanczos")))
-        if not self.resize_modes:
-            raise ValueError("degradation.resize_modes must not be empty.")
-        for mode in self.resize_modes:
-            _resize_tensor(torch.zeros(3, 2, 2), (1, 1), mode)
-
-        probabilities = config.get("resize_probabilities")
-        if probabilities is None:
-            self.resize_probabilities = None
+    def apply_blur(self, image, py_rng):
+        if py_rng.random() >= self.blur_probability:
+            return image
+        sigma_x = py_rng.uniform(*self.sigma_range)
+        if py_rng.random() < self.isotropic_probability:
+            sigma_y = sigma_x
+            rotation = 0.0
         else:
-            self.resize_probabilities = [float(value) for value in probabilities]
-            if len(self.resize_probabilities) != len(self.resize_modes):
-                raise ValueError(
-                    "degradation.resize_probabilities must match degradation.resize_modes."
-                )
-            if any(value < 0 for value in self.resize_probabilities):
-                raise ValueError("degradation.resize_probabilities cannot contain negatives.")
-            if sum(self.resize_probabilities) <= 0:
-                raise ValueError("degradation.resize_probabilities must have a positive sum.")
+            sigma_y = py_rng.uniform(*self.sigma_range)
+            rotation = py_rng.uniform(*self.rotation_range)
+        kernel = _anisotropic_gaussian_kernel(
+            self.kernel_size,
+            sigma_x,
+            sigma_y,
+            rotation,
+        )
+        return _filter_rgb_tensor(image, kernel)
+
+    def choose_resize_mode(self, py_rng):
+        return py_rng.choices(
+            self.resize_modes,
+            weights=self.resize_mode_probabilities,
+            k=1,
+        )[0]
+
+    def apply_resize(self, image, base_size, py_rng):
+        direction = py_rng.choices(
+            self._RESIZE_DIRECTIONS,
+            weights=self.resize_direction_probabilities,
+            k=1,
+        )[0]
+        if direction == "down":
+            factor = py_rng.uniform(self.resize_scale_range[0], 1.0)
+        elif direction == "up":
+            factor = py_rng.uniform(1.0, self.resize_scale_range[1])
+        else:
+            factor = 1.0
+        target_size = (
+            max(1, round(base_size[0] * factor)),
+            max(1, round(base_size[1] * factor)),
+        )
+        return _resize_tensor(image, target_size, self.choose_resize_mode(py_rng))
+
+    def apply_noise(self, image, py_rng, np_rng):
+        if py_rng.random() >= self.noise_probability:
+            return image
+        if py_rng.random() < self.gaussian_noise_probability:
+            return _add_gaussian_noise(
+                image,
+                self.gaussian_sigma_range,
+                self.gray_noise_probability,
+                py_rng,
+                np_rng,
+            )
+        return _add_poisson_noise(
+            image,
+            self.poisson_peak_range,
+            self.gray_noise_probability,
+            py_rng,
+            np_rng,
+        )
+
+    def apply_jpeg(self, image, py_rng):
+        if py_rng.random() >= self.jpeg_probability:
+            return image
+        quality = round(py_rng.uniform(*self.jpeg_quality_range))
+        return _jpeg_compress(image, quality, self.jpeg_subsampling)
+
+
+class HighOrderDegradation:
+    """Two-stage high-order blur/resize/noise/JPEG degradation for synthetic LR."""
+
+    _FIRST_DEFAULTS = {
+        "blur_probability": 0.8,
+        "kernel_size": 15,
+        "isotropic_probability": 0.5,
+        "sigma_range": (0.2, 2.0),
+        "rotation_range": (-math.pi, math.pi),
+        "resize_scale_range": (0.5, 1.5),
+        "resize_direction_probabilities": (0.7, 0.2, 0.1),
+        "resize_modes": ("bicubic", "bilinear", "lanczos"),
+        "resize_mode_probabilities": (0.5, 0.25, 0.25),
+        "noise_probability": 0.8,
+        "gaussian_noise_probability": 0.6,
+        "gray_noise_probability": 0.2,
+        "gaussian_sigma_range": (1.0, 10.0),
+        "poisson_peak_range": (100.0, 1000.0),
+        "jpeg_probability": 0.8,
+        "jpeg_quality_range": (60, 95),
+        "jpeg_subsampling": 2,
+    }
+    _SECOND_DEFAULTS = {
+        "blur_probability": 0.4,
+        "kernel_size": 15,
+        "isotropic_probability": 0.7,
+        "sigma_range": (0.2, 1.2),
+        "rotation_range": (-math.pi, math.pi),
+        "resize_scale_range": (0.7, 1.2),
+        "resize_direction_probabilities": (0.4, 0.3, 0.3),
+        "resize_modes": ("bicubic", "bilinear", "lanczos"),
+        "resize_mode_probabilities": (0.5, 0.25, 0.25),
+        "noise_probability": 0.8,
+        "gaussian_noise_probability": 0.6,
+        "gray_noise_probability": 0.2,
+        "gaussian_sigma_range": (1.0, 8.0),
+        "poisson_peak_range": (100.0, 1000.0),
+        "jpeg_probability": 1.0,
+        "jpeg_quality_range": (60, 95),
+        "jpeg_subsampling": 2,
+    }
+
+    def __init__(self, config):
+        if "first_order" in config:
+            first_config = config["first_order"]
+        else:
+            first_config = {
+                key: config[key]
+                for key in self._FIRST_DEFAULTS
+                if key in config
+            }
+            if "resize_probabilities" in config:
+                first_config["resize_mode_probabilities"] = config[
+                    "resize_probabilities"
+                ]
+        second_config = config.get("second_order", {})
+        final_config = config.get("final", {})
+        for name, value in (
+            ("first_order", first_config),
+            ("second_order", second_config),
+            ("final", final_config),
+        ):
+            if not isinstance(value, dict):
+                raise ValueError(f"degradation.{name} must be an object.")
+
+        self.first = _DegradationStage(
+            first_config,
+            self._FIRST_DEFAULTS,
+            "degradation.first_order",
+        )
+        self.second = _DegradationStage(
+            second_config,
+            self._SECOND_DEFAULTS,
+            "degradation.second_order",
+        )
+
+        final_path = "degradation.final"
+        self.sinc_probability = _probability(
+            final_config,
+            "sinc_probability",
+            0.8,
+            final_path,
+        )
+        self.sinc_kernel_size = int(final_config.get("sinc_kernel_size", 15))
+        if self.sinc_kernel_size < 3 or self.sinc_kernel_size % 2 == 0:
+            raise ValueError(f"{final_path}.sinc_kernel_size must be an odd integer >= 3.")
+        self.sinc_cutoff_range = _numeric_range(
+            final_config,
+            "sinc_cutoff_range",
+            (1.0 / 3.0, 1.0),
+            minimum=0.01,
+            maximum=1.0,
+            path=final_path,
+        )
+        self.jpeg_before_resize_probability = _probability(
+            final_config,
+            "jpeg_before_resize_probability",
+            0.5,
+            final_path,
+        )
+        self.final_resize_modes = list(
+            final_config.get("resize_modes", self._SECOND_DEFAULTS["resize_modes"])
+        )
+        if not self.final_resize_modes:
+            raise ValueError(f"{final_path}.resize_modes must not be empty.")
+        for mode in self.final_resize_modes:
+            _resize_tensor(torch.zeros(3, 2, 2), (1, 1), mode)
+        default_final_mode_probabilities = (
+            self._SECOND_DEFAULTS["resize_mode_probabilities"]
+            if "resize_modes" not in final_config
+            else [1.0] * len(self.final_resize_modes)
+        )
+        self.final_resize_mode_probabilities = _weights(
+            final_config,
+            "resize_mode_probabilities",
+            default_final_mode_probabilities,
+            len(self.final_resize_modes),
+            final_path,
+        )
+
+    def _resize_to_target(self, image, target_size, py_rng):
+        mode = py_rng.choices(
+            self.final_resize_modes,
+            weights=self.final_resize_mode_probabilities,
+            k=1,
+        )[0]
+        return _resize_tensor(image, target_size, mode)
+
+    def _apply_final_sinc(self, image, py_rng):
+        if py_rng.random() >= self.sinc_probability:
+            return image
+        cutoff = py_rng.uniform(*self.sinc_cutoff_range)
+        kernel = _windowed_sinc_kernel(self.sinc_kernel_size, cutoff)
+        return _filter_rgb_tensor(image, kernel)
 
     def __call__(self, hr, scale, py_rng=None, np_rng=None):
         py_rng = random if py_rng is None else py_rng
@@ -218,60 +521,32 @@ class RealisticDegradation:
         if height % scale != 0 or width % scale != 0:
             raise ValueError(
                 f"HR shape {(height, width)} must be divisible by scale={scale} "
-                "before realistic degradation."
-            )
-        if min(height, width) <= self.kernel_size // 2:
-            raise ValueError(
-                f"HR shape {(height, width)} is too small for degradation "
-                f"kernel_size={self.kernel_size}."
+                "before high-order degradation."
             )
 
-        degraded = hr
-        if py_rng.random() < self.blur_probability:
-            sigma_x = py_rng.uniform(*self.sigma_range)
-            if py_rng.random() < self.isotropic_probability:
-                sigma_y = sigma_x
-                rotation = 0.0
-            else:
-                sigma_y = py_rng.uniform(*self.sigma_range)
-                rotation = py_rng.uniform(*self.rotation_range)
-            kernel = _anisotropic_gaussian_kernel(
-                self.kernel_size,
-                sigma_x,
-                sigma_y,
-                rotation,
-            )
-            degraded = _filter_rgb_tensor(degraded, kernel)
+        target_size = (width // scale, height // scale)
+        degraded = self.first.apply_blur(hr, py_rng)
+        degraded = self.first.apply_resize(degraded, (width, height), py_rng)
+        degraded = self.first.apply_noise(degraded, py_rng, np_rng)
+        degraded = self.first.apply_jpeg(degraded, py_rng)
 
-        resize_mode = py_rng.choices(
-            self.resize_modes,
-            weights=self.resize_probabilities,
-            k=1,
-        )[0]
-        degraded = _resize_tensor(degraded, (width // scale, height // scale), resize_mode)
+        degraded = self.second.apply_blur(degraded, py_rng)
+        degraded = self.second.apply_resize(degraded, target_size, py_rng)
+        degraded = self.second.apply_noise(degraded, py_rng, np_rng)
 
-        if py_rng.random() < self.noise_probability:
-            if py_rng.random() < self.gaussian_noise_probability:
-                degraded = _add_gaussian_noise(
-                    degraded,
-                    self.gaussian_sigma_range,
-                    self.gray_noise_probability,
-                    py_rng,
-                    np_rng,
-                )
-            else:
-                degraded = _add_poisson_noise(
-                    degraded,
-                    self.poisson_peak_range,
-                    self.gray_noise_probability,
-                    py_rng,
-                    np_rng,
-                )
-
-        if py_rng.random() < self.jpeg_probability:
-            quality = round(py_rng.uniform(*self.jpeg_quality_range))
-            degraded = _jpeg_compress(degraded, quality, self.jpeg_subsampling)
+        if py_rng.random() < self.jpeg_before_resize_probability:
+            degraded = self.second.apply_jpeg(degraded, py_rng)
+            degraded = self._resize_to_target(degraded, target_size, py_rng)
+            degraded = self._apply_final_sinc(degraded, py_rng)
+        else:
+            degraded = self._resize_to_target(degraded, target_size, py_rng)
+            degraded = self._apply_final_sinc(degraded, py_rng)
+            degraded = self.second.apply_jpeg(degraded, py_rng)
         return degraded.clamp(0.0, 1.0).contiguous()
+
+
+# Backward-compatible import name; "realistic" now uses the two-stage pipeline.
+RealisticDegradation = HighOrderDegradation
 
 
 def split_train_val_paths(paths, split, val_ratio=0.05, seed=1234):
@@ -355,13 +630,15 @@ class PairedSRDataset(Dataset):
         if not isinstance(degradation_config, dict):
             raise ValueError("dataset.degradation must be an object.")
         self.degradation_type = str(degradation_config.get("type", "bicubic")).lower()
-        if self.degradation_type not in ("bicubic", "realistic"):
+        if self.degradation_type not in ("bicubic", "high_order", "realistic"):
             raise ValueError(
-                "dataset.degradation.type must be either 'bicubic' or 'realistic'."
+                "dataset.degradation.type must be 'bicubic' or 'high_order' "
+                "('realistic' is kept as a compatibility alias)."
             )
-        self.realistic_degradation = (
-            RealisticDegradation(degradation_config)
-            if self.degradation_type == "realistic" and split in ("train", "val")
+        self.high_order_degradation = (
+            HighOrderDegradation(degradation_config)
+            if self.degradation_type in ("high_order", "realistic")
+            and split in ("train", "val")
             else None
         )
         self.validation_degradation_seed = int(
@@ -439,12 +716,12 @@ class PairedSRDataset(Dataset):
             if valid_height == 0 or valid_width == 0:
                 raise ValueError(f"HR image is too small for scale={self.scale}: {(height, width)}")
             hr = hr[..., :valid_height, :valid_width]
-        if self.realistic_degradation is not None:
+        if self.high_order_degradation is not None:
             if self.split == "train":
-                lr = self.realistic_degradation(hr, self.scale)
+                lr = self.high_order_degradation(hr, self.scale)
             else:
                 validation_seed = self._validation_seed_for_path(hr_path)
-                lr = self.realistic_degradation(
+                lr = self.high_order_degradation(
                     hr,
                     self.scale,
                     py_rng=random.Random(validation_seed),
@@ -494,8 +771,8 @@ class PairedSRDataset(Dataset):
                 os.fspath(lr_path)
                 if lr_path is not None
                 else (
-                    "<synthetic:realistic>"
-                    if self.realistic_degradation is not None
+                    "<synthetic:high-order>"
+                    if self.high_order_degradation is not None
                     else "<bicubic>"
                 )
             ),

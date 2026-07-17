@@ -65,11 +65,15 @@ dataset/val/LR/0801x2.png
 ### 只有 HR
 
 把 `train_lr_dir` 和 `val_lr_dir` 设为 `null`，dataset 会从 HR 在线生成 ×2 LR。默认使用
-Pillow bicubic；将 `dataset.degradation.type` 设为 `"realistic"` 后，训练集会依次应用随机
-Gaussian/anisotropic blur、bilinear/bicubic/Lanczos 下采样、Gaussian/Poisson 噪声和 JPEG 压缩。
-各退化步骤的概率和强度范围均可在 `dataset.degradation` 中配置。验证集使用完全相同的退化
-参数分布，但会根据 `validation_seed` 和图片相对路径固定每张图的随机参数，使不同 epoch 的
-PSNR 可直接比较；训练集仍会在每次读取时重新随机退化。
+Pillow bicubic；将 `dataset.degradation.type` 设为 `"high_order"` 后，会使用二阶高阶退化：
+第一轮依次执行随机 Gaussian/anisotropic blur、随机上采样/下采样/保持尺寸、Gaussian/Poisson
+噪声和 JPEG；第二轮再次执行同类操作，最后通过可选的 windowed-sinc 低通滤波精确调整到
+目标 ×2 LR。最终 JPEG 与“精确缩放+sinc”的顺序也会随机交换，以模拟多次编辑和转码。
+
+验证集使用相同参数分布，但会根据 `validation_seed` 和图片相对路径固定每张图的完整随机序列，
+使不同 step 的 PSNR 可以直接比较；训练集仍会在每次读取时重新随机退化。旧的 `"realistic"`
+类型名称保留为 `"high_order"` 的兼容别名；旧版平铺的单阶段参数会自动映射为第一轮参数，
+未配置的第二轮和最终处理使用默认值。
 
 如果没有单独验证集，也可以把 `val_hr_dir` 设为 `null`，代码会按 `val_ratio` 从训练 HR 中
 固定划分验证集。若使用真实退化，推荐的初始配置如下：
@@ -77,26 +81,61 @@ PSNR 可直接比较；训练集仍会在每次读取时重新随机退化。
 ```json
 {
   "degradation": {
-    "type": "realistic",
+    "type": "high_order",
     "validation_seed": 1234,
-    "blur_probability": 0.8,
-    "kernel_size": 15,
-    "isotropic_probability": 0.5,
-    "sigma_range": [0.2, 2.0],
-    "rotation_range": [-3.1416, 3.1416],
-    "resize_modes": ["bicubic", "bilinear", "lanczos"],
-    "resize_probabilities": [0.5, 0.25, 0.25],
-    "noise_probability": 0.8,
-    "gaussian_noise_probability": 0.6,
-    "gray_noise_probability": 0.2,
-    "gaussian_sigma_range": [1.0, 10.0],
-    "poisson_peak_range": [100.0, 1000.0],
-    "jpeg_probability": 0.8,
-    "jpeg_quality_range": [60, 95],
-    "jpeg_subsampling": 2
+    "first_order": {
+      "blur_probability": 0.8,
+      "kernel_size": 15,
+      "isotropic_probability": 0.5,
+      "sigma_range": [0.2, 2.0],
+      "rotation_range": [-3.1416, 3.1416],
+      "resize_scale_range": [0.5, 1.5],
+      "resize_direction_probabilities": [0.7, 0.2, 0.1],
+      "resize_modes": ["bicubic", "bilinear", "lanczos"],
+      "resize_mode_probabilities": [0.5, 0.25, 0.25],
+      "noise_probability": 0.8,
+      "gaussian_noise_probability": 0.6,
+      "gray_noise_probability": 0.2,
+      "gaussian_sigma_range": [1.0, 10.0],
+      "poisson_peak_range": [100.0, 1000.0],
+      "jpeg_probability": 0.8,
+      "jpeg_quality_range": [60, 95],
+      "jpeg_subsampling": 2
+    },
+    "second_order": {
+      "blur_probability": 0.4,
+      "kernel_size": 15,
+      "isotropic_probability": 0.7,
+      "sigma_range": [0.2, 1.2],
+      "rotation_range": [-3.1416, 3.1416],
+      "resize_scale_range": [0.7, 1.2],
+      "resize_direction_probabilities": [0.4, 0.3, 0.3],
+      "resize_modes": ["bicubic", "bilinear", "lanczos"],
+      "resize_mode_probabilities": [0.5, 0.25, 0.25],
+      "noise_probability": 0.8,
+      "gaussian_noise_probability": 0.6,
+      "gray_noise_probability": 0.2,
+      "gaussian_sigma_range": [1.0, 8.0],
+      "poisson_peak_range": [100.0, 1000.0],
+      "jpeg_probability": 1.0,
+      "jpeg_quality_range": [60, 95],
+      "jpeg_subsampling": 2
+    },
+    "final": {
+      "sinc_probability": 0.8,
+      "sinc_kernel_size": 15,
+      "sinc_cutoff_range": [0.3333, 1.0],
+      "jpeg_before_resize_probability": 0.5,
+      "resize_modes": ["bicubic", "bilinear", "lanczos"],
+      "resize_mode_probabilities": [0.5, 0.25, 0.25]
+    }
   }
 }
 ```
+
+`resize_direction_probabilities` 的顺序是 `[缩小, 放大, 保持]`；第一轮缩放相对 HR 当前尺寸，
+第二轮缩放相对目标 LR 尺寸，最后一定会精确对齐到 `HR / scale`。`resize_mode_probabilities`
+与同一段里的 `resize_modes` 一一对应。
 
 `gaussian_sigma_range` 的单位是 8-bit 像素值，`poisson_peak_range` 越小表示噪声越强，
 `jpeg_quality_range` 越小表示压缩越强；`jpeg_subsampling=2` 表示常见的 4:2:0 色度抽样。
