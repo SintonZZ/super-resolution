@@ -135,6 +135,10 @@ cp config/train.json config/train.local.json
 .venv/bin/python train.py --config config/train.local.json
 ```
 
+训练过程按 optimizer step 计数；默认训练 100,000 steps，前 1,000 steps 线性 warmup，随后使用
+cosine 学习率衰减。可通过 `--steps` 覆盖总步数。训练同时维护 `ema_decay=0.999` 的 EMA 模型，
+验证、最佳 checkpoint 选择以及后续测试/推理/导出默认使用 EMA 权重。
+
 也可以从命令行覆盖常用参数：
 
 ```bash
@@ -147,8 +151,9 @@ cp config/train.json config/train.local.json
 ```
 
 输出目录包含 `config.json`、`train.log`、`latest_model.pth`、`best_model.pth` 和周期 checkpoint。
-恢复中断训练使用 `--resume /path/to/latest_model.pth`，它会严格恢复模型、optimizer、epoch 和
-AMP scaler。
+`best_model.pth` 只会在实际执行验证且配置的 `validation.best_metric` 提升时更新。恢复中断训练
+使用 `--resume /path/to/latest_model.pth`，它会恢复在线模型、EMA、optimizer、global step、
+数据 epoch 和 AMP scaler；旧版 epoch checkpoint 会按当前 DataLoader 长度推算 global step。
 
 ## 测试与推理
 
@@ -172,6 +177,9 @@ SR 图像；真实 HR 仅用于计算 PSNR。
   --input /path/to/lr_images \
   --output-dir results/inference
 ```
+
+模型预测的 SR 图像直接保存在 `output-dir`，对应的“LR 双线性放大 vs 模型 SR”对比图保存在
+`output-dir/comparisons`。
 
 显存不足时可增加 `--tile-size 256 --tile-pad 24`。`tile-size` 单位是 LR 像素。
 

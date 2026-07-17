@@ -14,6 +14,7 @@ from util import (
     load_torch,
     resolve_auto_device,
     save_image,
+    save_sr_comparison,
 )
 
 
@@ -55,6 +56,7 @@ def main():
         raise ValueError(f"No images found: {args.input}")
 
     output_dir = Path(args.output_dir)
+    comparison_dir = output_dir / "comparisons"
     output_dir.mkdir(parents=True, exist_ok=True)
     for index, path in enumerate(tqdm(paths, desc="Inference")):
         input_tensor = load_rgb_tensor(path).unsqueeze(0).to(device)
@@ -65,9 +67,18 @@ def main():
             tile_size=args.tile_size,
             tile_pad=args.tile_pad,
         ).clamp(0.0, 1.0)
-        save_image(output, output_dir / f"{index:05d}_{path.stem}_x{scale}.png")
+        output_name = f"{index:05d}_{path.stem}_x{scale}"
+        save_image(output, output_dir / f"{output_name}.png")
+        save_sr_comparison(
+            input_tensor,
+            output,
+            comparison_dir / f"{output_name}_bilinear_vs_model.png",
+        )
 
-    print(f"Saved {len(paths)} image(s) to {output_dir}")
+    print(
+        f"Saved {len(paths)} SR image(s) to {output_dir} "
+        f"and comparison image(s) to {comparison_dir}"
+    )
 
 
 if __name__ == "__main__":

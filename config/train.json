@@ -1,8 +1,8 @@
 {
   "training": {
     "desc": "spanf_x2_baseline",
-    "total_epochs": 100,
-    "cycle_length": 100,
+    "total_steps": 100000,
+    "warmup_steps": 1000,
     "max_lr": 0.0002,
     "min_lr": 0.000001,
     "betas": [0.9, 0.99],
@@ -10,12 +10,14 @@
     "batch_size": 16,
     "num_workers": 16,
     "save_dir": "checkpoints/run_{timestamp}_{desc}",
-    "save_interval": 10,
-    "val_interval": 10,
+    "log_interval": 100,
+    "save_interval": 5000,
+    "val_interval": 5000,
     "device": "auto",
     "seed": 1234,
     "resume": null,
     "amp": true,
+    "ema_decay": 0.999,
     "clip_grad_norm": 0.0,
     "drop_last": false,
     "cudnn_benchmark": true
@@ -26,7 +28,7 @@
     "val_hr_dir": "/opt/data/private/dataset/rgb/DF2K/val",
     "val_lr_dir": null,
     "scale": 2,
-    "lr_patch_size": 256,
+    "lr_patch_size": 128,
     "filename_template": "{}",
     "recursive": true,
     "val_ratio": 0.05,
@@ -65,8 +67,9 @@
     "type": "l1"
   },
   "validation": {
+    "best_metric": "y_psnr",
     "crop_border": 2,
-    "tile_size": 256,
+    "tile_size": 128,
     "tile_pad": 24
   }
 }
