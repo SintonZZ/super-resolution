@@ -67,8 +67,9 @@ dataset/val/LR/0801x2.png
 把 `train_lr_dir` 和 `val_lr_dir` 设为 `null`，dataset 会从 HR 在线生成 ×2 LR。默认使用
 Pillow bicubic；将 `dataset.degradation.type` 设为 `"realistic"` 后，训练集会依次应用随机
 Gaussian/anisotropic blur、bilinear/bicubic/Lanczos 下采样、Gaussian/Poisson 噪声和 JPEG 压缩。
-各退化步骤的概率和强度范围均可在 `dataset.degradation` 中配置。验证集始终使用确定性的
-bicubic 下采样，使不同 epoch 的 PSNR 可直接比较。
+各退化步骤的概率和强度范围均可在 `dataset.degradation` 中配置。验证集使用完全相同的退化
+参数分布，但会根据 `validation_seed` 和图片相对路径固定每张图的随机参数，使不同 epoch 的
+PSNR 可直接比较；训练集仍会在每次读取时重新随机退化。
 
 如果没有单独验证集，也可以把 `val_hr_dir` 设为 `null`，代码会按 `val_ratio` 从训练 HR 中
 固定划分验证集。若使用真实退化，推荐的初始配置如下：
@@ -77,6 +78,7 @@ bicubic 下采样，使不同 epoch 的 PSNR 可直接比较。
 {
   "degradation": {
     "type": "realistic",
+    "validation_seed": 1234,
     "blur_probability": 0.8,
     "kernel_size": 15,
     "isotropic_probability": 0.5,
@@ -98,7 +100,8 @@ bicubic 下采样，使不同 epoch 的 PSNR 可直接比较。
 
 `gaussian_sigma_range` 的单位是 8-bit 像素值，`poisson_peak_range` 越小表示噪声越强，
 `jpeg_quality_range` 越小表示压缩越强；`jpeg_subsampling=2` 表示常见的 4:2:0 色度抽样。
-将 `type` 改回 `"bicubic"` 即可恢复原始行为。
+`validation_seed` 只控制固定验证退化，不会让训练退化失去随机性。将 `type` 改回
+`"bicubic"` 即可让训练集和验证集都恢复原始 bicubic 行为。
 
 可以直接运行 `dataset.py` 预览指定样本的 LR/HR 对比。脚本会把 LR 放大到 HR 尺寸后并排
 保存，`--seed` 可用于观察同一 HR 的不同随机退化结果：

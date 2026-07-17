@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import io
 import json
 import math
@@ -101,10 +102,10 @@ def _resize_tensor(image, size, mode):
     return torch.from_numpy(np.ascontiguousarray(array.transpose(2, 0, 1)))
 
 
-def _add_gaussian_noise(image, sigma_range, gray_probability):
-    sigma = random.uniform(*sigma_range) / 255.0
-    channels = 1 if random.random() < gray_probability else image.shape[0]
-    noise = np.random.normal(
+def _add_gaussian_noise(image, sigma_range, gray_probability, py_rng, np_rng):
+    sigma = py_rng.uniform(*sigma_range) / 255.0
+    channels = 1 if py_rng.random() < gray_probability else image.shape[0]
+    noise = np_rng.normal(
         0.0,
         sigma,
         size=(channels, image.shape[1], image.shape[2]),
@@ -114,18 +115,18 @@ def _add_gaussian_noise(image, sigma_range, gray_probability):
     return (image + image.new_tensor(noise)).clamp(0.0, 1.0)
 
 
-def _add_poisson_noise(image, peak_range, gray_probability):
-    peak = random.uniform(*peak_range)
+def _add_poisson_noise(image, peak_range, gray_probability, py_rng, np_rng):
+    peak = py_rng.uniform(*peak_range)
     array = image.numpy()
-    if random.random() < gray_probability:
+    if py_rng.random() < gray_probability:
         luminance = (
             array[0] * 0.299 + array[1] * 0.587 + array[2] * 0.114
         )[None, ...]
-        noisy_luminance = np.random.poisson(luminance * peak).astype(np.float32) / peak
+        noisy_luminance = np_rng.poisson(luminance * peak).astype(np.float32) / peak
         noise = noisy_luminance - luminance
         noisy = array + noise
     else:
-        noisy = np.random.poisson(array * peak).astype(np.float32) / peak
+        noisy = np_rng.poisson(array * peak).astype(np.float32) / peak
     return torch.from_numpy(np.ascontiguousarray(noisy)).clamp(0.0, 1.0)
 
 
@@ -210,7 +211,9 @@ class RealisticDegradation:
             if sum(self.resize_probabilities) <= 0:
                 raise ValueError("degradation.resize_probabilities must have a positive sum.")
 
-    def __call__(self, hr, scale):
+    def __call__(self, hr, scale, py_rng=None, np_rng=None):
+        py_rng = random if py_rng is None else py_rng
+        np_rng = np.random if np_rng is None else np_rng
         height, width = hr.shape[-2:]
         if height % scale != 0 or width % scale != 0:
             raise ValueError(
@@ -224,14 +227,14 @@ class RealisticDegradation:
             )
 
         degraded = hr
-        if random.random() < self.blur_probability:
-            sigma_x = random.uniform(*self.sigma_range)
-            if random.random() < self.isotropic_probability:
+        if py_rng.random() < self.blur_probability:
+            sigma_x = py_rng.uniform(*self.sigma_range)
+            if py_rng.random() < self.isotropic_probability:
                 sigma_y = sigma_x
                 rotation = 0.0
             else:
-                sigma_y = random.uniform(*self.sigma_range)
-                rotation = random.uniform(*self.rotation_range)
+                sigma_y = py_rng.uniform(*self.sigma_range)
+                rotation = py_rng.uniform(*self.rotation_range)
             kernel = _anisotropic_gaussian_kernel(
                 self.kernel_size,
                 sigma_x,
@@ -240,29 +243,33 @@ class RealisticDegradation:
             )
             degraded = _filter_rgb_tensor(degraded, kernel)
 
-        resize_mode = random.choices(
+        resize_mode = py_rng.choices(
             self.resize_modes,
             weights=self.resize_probabilities,
             k=1,
         )[0]
         degraded = _resize_tensor(degraded, (width // scale, height // scale), resize_mode)
 
-        if random.random() < self.noise_probability:
-            if random.random() < self.gaussian_noise_probability:
+        if py_rng.random() < self.noise_probability:
+            if py_rng.random() < self.gaussian_noise_probability:
                 degraded = _add_gaussian_noise(
                     degraded,
                     self.gaussian_sigma_range,
                     self.gray_noise_probability,
+                    py_rng,
+                    np_rng,
                 )
             else:
                 degraded = _add_poisson_noise(
                     degraded,
                     self.poisson_peak_range,
                     self.gray_noise_probability,
+                    py_rng,
+                    np_rng,
                 )
 
-        if random.random() < self.jpeg_probability:
-            quality = round(random.uniform(*self.jpeg_quality_range))
+        if py_rng.random() < self.jpeg_probability:
+            quality = round(py_rng.uniform(*self.jpeg_quality_range))
             degraded = _jpeg_compress(degraded, quality, self.jpeg_subsampling)
         return degraded.clamp(0.0, 1.0).contiguous()
 
@@ -354,8 +361,11 @@ class PairedSRDataset(Dataset):
             )
         self.realistic_degradation = (
             RealisticDegradation(degradation_config)
-            if self.degradation_type == "realistic" and split == "train"
+            if self.degradation_type == "realistic" and split in ("train", "val")
             else None
+        )
+        self.validation_degradation_seed = int(
+            degradation_config.get("validation_seed", args.get("seed", 1234))
         )
 
         hr_paths = list_image_files(self.hr_root, recursive=bool(args.get("recursive", True)))
@@ -406,7 +416,12 @@ class PairedSRDataset(Dataset):
         hr = hr[..., hr_top:hr_top + hr_patch, hr_left:hr_left + hr_patch]
         return lr, hr
 
-    def _make_synthetic_pair(self, hr):
+    def _validation_seed_for_path(self, hr_path):
+        relative_path = hr_path.relative_to(self.hr_root).as_posix().encode("utf-8")
+        path_seed = int.from_bytes(hashlib.sha256(relative_path).digest()[:4], "little")
+        return (self.validation_degradation_seed + path_seed) % (2 ** 32)
+
+    def _make_synthetic_pair(self, hr, hr_path):
         height, width = hr.shape[-2:]
         if self.split == "train":
             hr_patch = self.lr_patch_size * self.scale
@@ -425,10 +440,17 @@ class PairedSRDataset(Dataset):
                 raise ValueError(f"HR image is too small for scale={self.scale}: {(height, width)}")
             hr = hr[..., :valid_height, :valid_width]
         if self.realistic_degradation is not None:
-            lr = self.realistic_degradation(hr, self.scale)
+            if self.split == "train":
+                lr = self.realistic_degradation(hr, self.scale)
+            else:
+                validation_seed = self._validation_seed_for_path(hr_path)
+                lr = self.realistic_degradation(
+                    hr,
+                    self.scale,
+                    py_rng=random.Random(validation_seed),
+                    np_rng=np.random.RandomState(validation_seed),
+                )
         else:
-            # Validation intentionally stays deterministic even when realistic
-            # training degradation is enabled.
             lr = bicubic_downsample(hr, self.scale)
         return lr, hr
 
@@ -451,7 +473,7 @@ class PairedSRDataset(Dataset):
         hr = load_rgb_tensor(hr_path)
 
         if lr_path is None:
-            lr, hr = self._make_synthetic_pair(hr)
+            lr, hr = self._make_synthetic_pair(hr, hr_path)
         else:
             lr = load_rgb_tensor(lr_path)
             expected_hr_shape = (lr.shape[-2] * self.scale, lr.shape[-1] * self.scale)
@@ -557,6 +579,11 @@ def preview_main():
 
     dataset_config = _load_preview_config(args.config)
     seed = int(dataset_config.get("seed", 1234) if args.seed is None else args.seed)
+    if args.seed is not None and args.split == "val":
+        dataset_config = dict(dataset_config)
+        degradation_config = dict(dataset_config.get("degradation") or {})
+        degradation_config["validation_seed"] = seed
+        dataset_config["degradation"] = degradation_config
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
