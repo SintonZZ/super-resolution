@@ -17,7 +17,9 @@ from dataset import PairedSRDataset
 from util import (
     AverageMeter,
     calc_psnr,
+    clean_state_dict,
     count_parameters,
+    extract_state_dict,
     forward_tiled,
     load_torch,
     resolve_auto_device,
@@ -223,6 +225,33 @@ def resume_training(
     return start_step, data_epoch, best_metric
 
 
+def validate_initialization_config(training_config):
+    resume_path = training_config.get("resume")
+    pretrained_path = training_config.get("pretrained")
+    if resume_path and pretrained_path:
+        raise ValueError(
+            "training.resume and training.pretrained are mutually exclusive: "
+            "resume restores complete training state, while pretrained starts a new run."
+        )
+
+
+def load_pretrained_model(model, pretrained_path, device, logger):
+    """Load preferred inference weights without restoring any training state."""
+    if not pretrained_path:
+        return None
+
+    checkpoint = load_torch(pretrained_path, map_location=device)
+    state_dict, state_key = extract_state_dict(checkpoint)
+    model.load_state_dict(clean_state_dict(state_dict), strict=True)
+    logger.info(
+        "Loaded pretrained model weights from %s (state key: %s); "
+        "optimizer, EMA, step, and best metric will start fresh.",
+        pretrained_path,
+        state_key,
+    )
+    return state_key
+
+
 def train_one_step(model, batch, criterion, optimizer, scaler, ema, use_amp, device, config, step):
     model.train()
     base_lr = set_step_lr(optimizer, step, config["training"])
@@ -317,7 +346,9 @@ def parse_args():
     parser.add_argument("--train-lr-dir", default=None)
     parser.add_argument("--val-hr-dir", default=None)
     parser.add_argument("--val-lr-dir", default=None)
-    parser.add_argument("--resume", default=None)
+    initialization = parser.add_mutually_exclusive_group()
+    initialization.add_argument("--resume", default=None)
+    initialization.add_argument("--pretrained", default=None)
     parser.add_argument("--save-dir", default=None)
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -343,6 +374,7 @@ def apply_overrides(config, args):
 
     training_updates = {
         "resume": args.resume,
+        "pretrained": args.pretrained,
         "save_dir": args.save_dir,
         "total_steps": args.steps,
         "batch_size": args.batch_size,
@@ -358,6 +390,7 @@ def main():
     args = parse_args()
     config = load_config(args.config)
     apply_overrides(config, args)
+    validate_initialization_config(config["training"])
     expand_save_dir(config)
 
     if int(config["model"].get("upscale", 2)) != 2:
@@ -413,6 +446,9 @@ def main():
     )
 
     resume_path = training.get("resume")
+    pretrained_path = training.get("pretrained")
+
+    load_pretrained_model(model, pretrained_path, device, logger)
 
     criterion = build_loss(config["loss"].get("type", "l1")).to(device)
     optimizer = build_optimizer(model, training)

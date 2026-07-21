@@ -11,13 +11,54 @@ from train import (
     ModelEMA,
     build_checkpoint,
     get_step_lr,
+    load_pretrained_model,
     resume_training,
     update_best_metric,
+    validate_initialization_config,
 )
 from util import extract_state_dict
 
 
 class StepTrainingTest(unittest.TestCase):
+    def test_pretrained_prefers_ema_and_starts_a_fresh_ema(self):
+        online = nn.Linear(1, 1, bias=False)
+        ema_source = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            online.weight.fill_(2.0)
+            ema_source.weight.fill_(1.0)
+        checkpoint = {
+            "model_state_dict": online.state_dict(),
+            "params_ema": ema_source.state_dict(),
+            "optimizer_state_dict": {"should_not_be_loaded": True},
+            "step": 999,
+            "best_metric": 42.0,
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pretrained.pth"
+            torch.save(checkpoint, path)
+            target = nn.Linear(1, 1, bias=False)
+            state_key = load_pretrained_model(
+                target,
+                path,
+                "cpu",
+                logging.getLogger("test_pretrained"),
+            )
+            fresh_optimizer = torch.optim.Adam(target.parameters(), lr=1e-5)
+            fresh_ema = ModelEMA(target, decay=0.999)
+
+        self.assertEqual(state_key, "params_ema")
+        self.assertAlmostEqual(target.weight.item(), 1.0)
+        self.assertAlmostEqual(fresh_ema.module.weight.item(), 1.0)
+        self.assertEqual(fresh_optimizer.state_dict()["state"], {})
+
+    def test_resume_and_pretrained_are_mutually_exclusive(self):
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            validate_initialization_config({
+                "resume": "latest_model.pth",
+                "pretrained": "best_model.pth",
+            })
+
     def test_step_lr_uses_linear_warmup_then_cosine_decay(self):
         config = {
             "total_steps": 100,

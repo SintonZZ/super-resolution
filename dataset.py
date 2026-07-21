@@ -612,6 +612,81 @@ def _find_lr_path(hr_path, hr_root, lr_root, filename_template):
     )
 
 
+def _resolve_manifest_image_path(manifest_path, value, key, line_number):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(
+            f"{manifest_path}:{line_number} field {key!r} must be a non-empty path."
+        )
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = manifest_path.parent / path
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"{manifest_path}:{line_number} field {key!r} does not exist: {path}"
+        )
+    return path
+
+
+def load_manifest_samples(manifest_path, split):
+    """Load explicit paired LR/HR samples for one split from JSON Lines."""
+    manifest_path = Path(manifest_path).expanduser()
+    if not manifest_path.is_file():
+        raise FileNotFoundError(f"Dataset manifest does not exist: {manifest_path}")
+
+    samples = []
+    names = set()
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Invalid JSON in dataset manifest {manifest_path}:{line_number}: {error}"
+                ) from error
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"{manifest_path}:{line_number} must contain a JSON object."
+                )
+            record_split = record.get("split")
+            if record_split not in ("train", "val", "test"):
+                raise ValueError(
+                    f"{manifest_path}:{line_number} has invalid split {record_split!r}."
+                )
+            if record_split != split:
+                continue
+
+            lr_path = _resolve_manifest_image_path(
+                manifest_path,
+                record.get("lr_path"),
+                "lr_path",
+                line_number,
+            )
+            hr_path = _resolve_manifest_image_path(
+                manifest_path,
+                record.get("hr_path"),
+                "hr_path",
+                line_number,
+            )
+            name = record.get("name", hr_path.stem)
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"{manifest_path}:{line_number} field 'name' must be a non-empty string."
+                )
+            if name in names:
+                raise ValueError(
+                    f"Duplicate sample name {name!r} for split={split} in {manifest_path}."
+                )
+            names.add(name)
+            samples.append((lr_path, hr_path, name))
+
+    if not samples:
+        raise ValueError(f"No samples for split={split} in manifest {manifest_path}.")
+    return samples
+
+
 class PairedSRDataset(Dataset):
     """Paired LR/HR dataset with optional on-the-fly synthetic LR generation."""
 
@@ -622,7 +697,14 @@ class PairedSRDataset(Dataset):
         self.scale = int(args.get("scale", 2))
         self.lr_patch_size = int(args.get("lr_patch_size", 64))
         self.augment = bool(args.get("augment", split == "train")) and split == "train"
-        self.hr_root, self.lr_root = _roots_for_split(args, split)
+        manifest_path = args.get("manifest_path")
+        self.manifest_path = (
+            Path(manifest_path).expanduser() if manifest_path else None
+        )
+        if self.manifest_path is None:
+            self.hr_root, self.lr_root = _roots_for_split(args, split)
+        else:
+            self.hr_root, self.lr_root = None, None
 
         degradation_config = args.get("degradation", {})
         if degradation_config is None:
@@ -645,34 +727,47 @@ class PairedSRDataset(Dataset):
             degradation_config.get("validation_seed", args.get("seed", 1234))
         )
 
-        hr_paths = list_image_files(self.hr_root, recursive=bool(args.get("recursive", True)))
-        uses_train_val_split = split in ("train", "val") and not args.get("val_hr_dir")
-        if uses_train_val_split:
-            hr_paths = split_train_val_paths(
-                hr_paths,
-                split=split,
-                val_ratio=float(args.get("val_ratio", 0.05)),
-                seed=int(args.get("seed", 1234)),
-            )
-
-        max_images = args.get("max_images")
-        if max_images is not None:
-            hr_paths = hr_paths[:int(max_images)]
-        if not hr_paths:
-            raise ValueError(f"No HR images found under {self.hr_root}")
-
-        filename_template = args.get("filename_template", "{}")
-        self.samples = []
-        for hr_path in hr_paths:
-            lr_path = None
-            if self.lr_root is not None:
-                lr_path = _find_lr_path(
-                    hr_path,
-                    self.hr_root,
-                    self.lr_root,
-                    filename_template,
+        if self.manifest_path is not None:
+            self.samples = load_manifest_samples(self.manifest_path, split)
+            max_images = args.get("max_images")
+            if max_images is not None:
+                self.samples = self.samples[:int(max_images)]
+            if not self.samples:
+                raise ValueError(
+                    f"No samples left for split={split} after applying max_images."
                 )
-            self.samples.append((lr_path, hr_path))
+        else:
+            hr_paths = list_image_files(
+                self.hr_root,
+                recursive=bool(args.get("recursive", True)),
+            )
+            uses_train_val_split = split in ("train", "val") and not args.get("val_hr_dir")
+            if uses_train_val_split:
+                hr_paths = split_train_val_paths(
+                    hr_paths,
+                    split=split,
+                    val_ratio=float(args.get("val_ratio", 0.05)),
+                    seed=int(args.get("seed", 1234)),
+                )
+
+            max_images = args.get("max_images")
+            if max_images is not None:
+                hr_paths = hr_paths[:int(max_images)]
+            if not hr_paths:
+                raise ValueError(f"No HR images found under {self.hr_root}")
+
+            filename_template = args.get("filename_template", "{}")
+            self.samples = []
+            for hr_path in hr_paths:
+                lr_path = None
+                if self.lr_root is not None:
+                    lr_path = _find_lr_path(
+                        hr_path,
+                        self.hr_root,
+                        self.lr_root,
+                        filename_template,
+                    )
+                self.samples.append((lr_path, hr_path, hr_path.stem))
 
     def __len__(self):
         return len(self.samples)
@@ -746,7 +841,7 @@ class PairedSRDataset(Dataset):
         return lr.contiguous(), hr.contiguous()
 
     def __getitem__(self, index):
-        lr_path, hr_path = self.samples[index]
+        lr_path, hr_path, name = self.samples[index]
         hr = load_rgb_tensor(hr_path)
 
         if lr_path is None:
@@ -766,7 +861,7 @@ class PairedSRDataset(Dataset):
         return {
             "input": lr,
             "target": hr,
-            "name": hr_path.stem,
+            "name": name,
             "lr_path": (
                 os.fspath(lr_path)
                 if lr_path is not None

@@ -1,3 +1,4 @@
+import json
 import random
 import tempfile
 import unittest
@@ -53,6 +54,56 @@ def high_order_config(first_overrides=None, second_overrides=None, final_overrid
 
 
 class DatasetTest(unittest.TestCase):
+    def test_manifest_loads_relative_pairs_and_filters_split(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            save_random_image(root / "train" / "HR" / "train.png", 32, 40, 20)
+            save_random_image(root / "train" / "LR" / "train.png", 16, 20, 21)
+            save_random_image(root / "val" / "HR" / "val.png", 24, 28, 22)
+            save_random_image(root / "val" / "LR" / "val.png", 12, 14, 23)
+            manifest = root / "manifest.jsonl"
+            rows = [
+                {
+                    "name": "train_sample",
+                    "split": "train",
+                    "lr_path": "train/LR/train.png",
+                    "hr_path": "train/HR/train.png",
+                },
+                {
+                    "name": "val_sample",
+                    "split": "val",
+                    "lr_path": "val/LR/val.png",
+                    "hr_path": "val/HR/val.png",
+                },
+            ]
+            manifest.write_text(
+                "".join(json.dumps(row) + "\n" for row in rows),
+                encoding="utf-8",
+            )
+            train_dataset = PairedSRDataset(
+                {
+                    "manifest_path": str(manifest),
+                    "scale": 2,
+                    "lr_patch_size": 8,
+                    "augment": False,
+                },
+                split="train",
+            )
+            val_dataset = PairedSRDataset(
+                {"manifest_path": str(manifest), "scale": 2},
+                split="val",
+            )
+            train_item = train_dataset[0]
+            val_item = val_dataset[0]
+
+        self.assertEqual(len(train_dataset), 1)
+        self.assertEqual(train_item["name"], "train_sample")
+        self.assertEqual(tuple(train_item["input"].shape), (3, 8, 8))
+        self.assertEqual(tuple(train_item["target"].shape), (3, 16, 16))
+        self.assertEqual(val_item["name"], "val_sample")
+        self.assertEqual(tuple(val_item["input"].shape), (3, 12, 14))
+        self.assertEqual(tuple(val_item["target"].shape), (3, 24, 28))
+
     def test_hr_only_generates_aligned_x2_pair(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

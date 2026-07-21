@@ -1,0 +1,52 @@
+{
+  "training": {
+    "desc": "spanf_x2_ov50q_finetune",
+    "total_steps": 30000,
+    "warmup_steps": 500,
+    "max_lr": 0.00002,
+    "min_lr": 0.0000001,
+    "betas": [0.9, 0.99],
+    "weight_decay": 0.0,
+    "batch_size": 4,
+    "num_workers": 8,
+    "save_dir": "checkpoints/run_{timestamp}_{desc}",
+    "log_interval": 100,
+    "save_interval": 2000,
+    "val_interval": 2000,
+    "device": "auto",
+    "seed": 1234,
+    "resume": null,
+    "pretrained": "checkpoints/run_20260717_115207_spanf_x2_baseline/best_model.pth",
+    "amp": true,
+    "ema_decay": 0.999,
+    "clip_grad_norm": 1.0,
+    "drop_last": false,
+    "cudnn_benchmark": true
+  },
+  "dataset": {
+    "manifest_path": "/mnt/d/ov50q_sr_dataset/manifest.jsonl",
+    "scale": 2,
+    "lr_patch_size": 256,
+    "seed": 1234,
+    "augment": false,
+    "max_images": null
+  },
+  "model": {
+    "type": "spanf",
+    "in_channels": 3,
+    "out_channels": 3,
+    "feature_channels": 32,
+    "upscale": 2,
+    "bias": true,
+    "nearest_init": true
+  },
+  "loss": {
+    "type": "l1"
+  },
+  "validation": {
+    "best_metric": "y_psnr",
+    "crop_border": 2,
+    "tile_size": 128,
+    "tile_pad": 24
+  }
+}
