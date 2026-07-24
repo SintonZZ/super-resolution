@@ -7,10 +7,14 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from util import save_sr_comparison, tensor_to_uint8_image
+from util import calc_ssim, save_sr_comparison, tensor_to_uint8_image
 
 
 class SRComparisonTest(unittest.TestCase):
+    def test_ssim_is_one_for_identical_images(self):
+        image = torch.rand(1, 3, 16, 16)
+        self.assertAlmostEqual(calc_ssim(image, image), 1.0, places=5)
+
     def test_saves_bilinear_input_and_model_output_side_by_side(self):
         inputs = torch.tensor(
             [[

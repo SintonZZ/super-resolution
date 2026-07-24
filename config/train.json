@@ -1,13 +1,6 @@
 {
   "training": {
-    "desc": "spanf_x2_baseline",
-    "total_steps": 100000,
-    "warmup_steps": 1000,
-    "max_lr": 0.0002,
-    "min_lr": 0.000001,
-    "betas": [0.9, 0.99],
-    "weight_decay": 0.0,
-    "batch_size": 16,
+    "desc": "spanf_x2_realesrgan",
     "num_workers": 16,
     "save_dir": "checkpoints/run_{timestamp}_{desc}",
     "log_interval": 100,
@@ -16,12 +9,103 @@
     "device": "auto",
     "seed": 1234,
     "resume": null,
-    "pretrained": null,
     "amp": true,
     "ema_decay": 0.999,
     "clip_grad_norm": 0.0,
     "drop_last": false,
-    "cudnn_benchmark": true
+    "cudnn_benchmark": true,
+    "stage1": {
+      "enabled": true,
+      "total_steps": 250000,
+      "warmup_steps": 0,
+      "max_lr": 0.0002,
+      "batch_size": 16,
+      "optimizer_g": {
+        "type": "adam",
+        "betas": [0.9, 0.99],
+        "weight_decay": 0.0
+      },
+      "scheduler": {
+        "type": "multistep",
+        "milestones": [250000],
+        "gamma": 0.5
+      },
+      "usm": {
+        "enabled": true,
+        "radius": 51,
+        "sigma": 0.0,
+        "weight": 0.5,
+        "threshold": 10.0,
+        "pixel_target": true
+      },
+      "loss": {
+        "pixel": {
+          "type": "l1",
+          "weight": 1.0
+        }
+      }
+    },
+    "stage2": {
+      "enabled": true,
+      "pretrained_generator": null,
+      "total_steps": 100000,
+      "warmup_steps": 0,
+      "max_lr": 0.0001,
+      "batch_size": 4,
+      "optimizer_g": {
+        "type": "adam",
+        "betas": [0.9, 0.99],
+        "weight_decay": 0.0
+      },
+      "optimizer_d": {
+        "type": "adam",
+        "betas": [0.9, 0.99],
+        "weight_decay": 0.0
+      },
+      "scheduler": {
+        "type": "multistep",
+        "milestones": [100000],
+        "gamma": 0.5
+      },
+      "usm": {
+        "enabled": true,
+        "radius": 51,
+        "sigma": 0.0,
+        "weight": 0.5,
+        "threshold": 10.0,
+        "pixel_target": true,
+        "perceptual_target": true,
+        "gan_target": false
+      },
+      "loss": {
+        "pixel": {
+          "type": "l1",
+          "weight": 1.0
+        },
+        "perceptual": {
+          "enabled": true,
+          "type": "vgg19",
+          "layer_weights": {
+            "conv1_2": 0.1,
+            "conv2_2": 0.1,
+            "conv3_4": 1.0,
+            "conv4_4": 1.0,
+            "conv5_4": 1.0
+          },
+          "criterion": "l1",
+          "use_input_norm": true,
+          "range_norm": false,
+          "weight": 1.0,
+          "style_weight": 0.0
+        },
+        "gan": {
+          "type": "vanilla",
+          "weight": 0.1,
+          "real_label": 1.0,
+          "fake_label": 0.0
+        }
+      }
+    }
   },
   "dataset": {
     "train_hr_dir": "/opt/data/private/dataset/rgb/DF2K/train",
@@ -96,13 +180,19 @@
     "bias": true,
     "nearest_init": true
   },
-  "loss": {
-    "type": "l1"
+  "discriminator": {
+    "type": "unet_sn",
+    "in_channels": 3,
+    "feature_channels": 64,
+    "skip_connection": true
   },
   "validation": {
-    "best_metric": "y_psnr",
     "crop_border": 2,
     "tile_size": 128,
-    "tile_pad": 24
+    "tile_pad": 24,
+    "lpips": {
+      "enabled": true,
+      "net": "alex"
+    }
   }
 }

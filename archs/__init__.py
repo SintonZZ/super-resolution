@@ -1,3 +1,4 @@
+from .discriminator import UNetDiscriminatorSN
 from .spanf import SPANF
 
 
@@ -16,4 +17,15 @@ def build_model(model_config):
     )
 
 
-__all__ = ["SPANF", "build_model"]
+def build_discriminator(discriminator_config):
+    discriminator_type = discriminator_config.get("type", "unet_sn")
+    if discriminator_type not in ("unet_sn", "UNetDiscriminatorSN"):
+        raise ValueError(f"Unsupported discriminator type: {discriminator_type}")
+    return UNetDiscriminatorSN(
+        num_in_ch=int(discriminator_config.get("in_channels", 3)),
+        num_feat=int(discriminator_config.get("feature_channels", 64)),
+        skip_connection=bool(discriminator_config.get("skip_connection", True)),
+    )
+
+
+__all__ = ["SPANF", "UNetDiscriminatorSN", "build_model", "build_discriminator"]

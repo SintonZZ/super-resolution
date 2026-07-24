@@ -5,21 +5,68 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from archs import build_model
+from losses import GANLoss
 from train import (
     ModelEMA,
     build_checkpoint,
     get_step_lr,
     load_pretrained_model,
     resume_training,
+    train_stage2_step,
     update_best_metric,
     validate_initialization_config,
+    validate_training_config,
 )
 from util import extract_state_dict
 
 
 class StepTrainingTest(unittest.TestCase):
+    def test_stage2_step_updates_generator_discriminator_and_ema(self):
+        class TinyPerceptual(nn.Module):
+            def forward(self, prediction, target):
+                return F.l1_loss(prediction, target), prediction.new_zeros(())
+
+        generator = nn.Conv2d(3, 3, 1)
+        discriminator = nn.Conv2d(3, 1, 1)
+        ema = ModelEMA(generator, decay=0.5)
+        optimizer_g = torch.optim.Adam(generator.parameters(), lr=1e-4)
+        optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=1e-4)
+        generator_before = generator.weight.detach().clone()
+        discriminator_before = discriminator.weight.detach().clone()
+        metrics = train_stage2_step(
+            generator,
+            discriminator,
+            {
+                "input": torch.rand(1, 3, 8, 8),
+                "target": torch.rand(1, 3, 8, 8),
+            },
+            nn.L1Loss(),
+            1.0,
+            TinyPerceptual(),
+            GANLoss(),
+            0.1,
+            optimizer_g,
+            optimizer_d,
+            scaler=None,
+            ema=ema,
+            use_amp=False,
+            device=torch.device("cpu"),
+            stage_config={
+                "total_steps": 2,
+                "max_lr": 1e-4,
+                "scheduler": {"type": "multistep", "milestones": [2]},
+            },
+            step=0,
+            usm_sharpener=None,
+        )
+        self.assertFalse(torch.equal(generator.weight, generator_before))
+        self.assertFalse(torch.equal(discriminator.weight, discriminator_before))
+        self.assertIn("perceptual_loss", metrics)
+        self.assertIn("d_loss", metrics)
+
     def test_pretrained_prefers_ema_and_starts_a_fresh_ema(self):
         online = nn.Linear(1, 1, bias=False)
         ema_source = nn.Linear(1, 1, bias=False)
@@ -70,6 +117,20 @@ class StepTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(get_step_lr(9, config), 1e-3)
         self.assertAlmostEqual(get_step_lr(10, config), 1e-3)
         self.assertAlmostEqual(get_step_lr(99, config), 1e-5)
+
+    def test_multistep_lr_stays_constant_until_milestone(self):
+        config = {
+            "total_steps": 100,
+            "warmup_steps": 0,
+            "max_lr": 2e-4,
+            "scheduler": {
+                "type": "multistep",
+                "milestones": [100],
+                "gamma": 0.5,
+            },
+        }
+        self.assertAlmostEqual(get_step_lr(0, config), 2e-4)
+        self.assertAlmostEqual(get_step_lr(99, config), 2e-4)
 
     def test_ema_updates_parameters_and_is_preferred_for_inference(self):
         model = nn.Linear(1, 1, bias=False)
@@ -172,6 +233,60 @@ class StepTrainingTest(unittest.TestCase):
         self.assertAlmostEqual(restored_model.weight.item(), 2.0)
         self.assertAlmostEqual(restored_ema.module.weight.item(), 1.0)
 
+    def test_stage2_checkpoint_restores_discriminator_and_both_optimizers(self):
+        model = nn.Linear(1, 1, bias=False)
+        discriminator = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            model.weight.fill_(2.0)
+            discriminator.weight.fill_(3.0)
+        ema = ModelEMA(model, decay=0.5)
+        optimizer_g = torch.optim.Adam(model.parameters(), lr=1e-4)
+        optimizer_d = torch.optim.Adam(discriminator.parameters(), lr=1e-4)
+        checkpoint = build_checkpoint(
+            model,
+            ema,
+            optimizer_g,
+            scaler=None,
+            step=9,
+            data_epoch=1,
+            best_metric=30.0,
+            metrics={},
+            config={},
+            active_stage="stage2",
+            completed_stages=["stage1"],
+            discriminator=discriminator,
+            optimizer_d=optimizer_d,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "stage2.pth"
+            torch.save(checkpoint, path)
+            restored_model = nn.Linear(1, 1, bias=False)
+            restored_discriminator = nn.Linear(1, 1, bias=False)
+            restored_ema = ModelEMA(restored_model)
+            restored_g_optimizer = torch.optim.Adam(
+                restored_model.parameters(), lr=1e-4
+            )
+            restored_d_optimizer = torch.optim.Adam(
+                restored_discriminator.parameters(), lr=1e-4
+            )
+            step, _, _ = resume_training(
+                restored_model,
+                restored_ema,
+                restored_g_optimizer,
+                scaler=None,
+                resume_path=path,
+                device="cpu",
+                logger=logging.getLogger("test_stage2_resume"),
+                steps_per_epoch=1,
+                discriminator=restored_discriminator,
+                optimizer_d=restored_d_optimizer,
+            )
+
+        self.assertEqual(step, 9)
+        self.assertAlmostEqual(restored_model.weight.item(), 2.0)
+        self.assertAlmostEqual(restored_discriminator.weight.item(), 3.0)
+
     def test_best_metric_only_changes_after_validation(self):
         best_metric, is_best = update_best_metric(None, 30.0, "y_psnr")
         self.assertEqual(best_metric, 30.0)
@@ -184,6 +299,32 @@ class StepTrainingTest(unittest.TestCase):
         )
         self.assertEqual(best_metric, 32.0)
         self.assertTrue(is_best)
+
+    def test_lower_is_better_metric(self):
+        best_metric, is_best = update_best_metric(
+            {"lpips": 0.2},
+            0.3,
+            "lpips",
+            mode="min",
+        )
+        self.assertEqual(best_metric, 0.2)
+        self.assertTrue(is_best)
+
+    def test_two_stage_config_requires_pretrained_when_stage1_is_disabled(self):
+        config = {
+            "training": {
+                "stage1": {"enabled": False},
+                "stage2": {
+                    "enabled": True,
+                    "total_steps": 10,
+                    "batch_size": 1,
+                    "loss": {"pixel": {"type": "l1"}},
+                },
+            },
+            "discriminator": {"type": "unet_sn"},
+        }
+        with self.assertRaisesRegex(ValueError, "pretrained_generator"):
+            validate_training_config(config)
 
 
 if __name__ == "__main__":

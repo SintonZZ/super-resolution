@@ -164,6 +164,58 @@ def calc_psnr(pred, target, crop_border=0, test_y_channel=False, eps=1e-12):
     return 10.0 * math.log10(1.0 / mse)
 
 
+def calc_ssim(pred, target, crop_border=0, window_size=11, sigma=1.5):
+    """Calculate mean RGB SSIM for NCHW tensors in the [0, 1] range."""
+    pred = pred.detach().float().clamp(0.0, 1.0)
+    target = target.detach().float().clamp(0.0, 1.0)
+    if pred.shape != target.shape:
+        raise ValueError(f"SSIM shape mismatch: {tuple(pred.shape)} vs {tuple(target.shape)}")
+    if crop_border > 0:
+        if pred.shape[-2] <= 2 * crop_border or pred.shape[-1] <= 2 * crop_border:
+            raise ValueError("crop_border is too large for the evaluated image.")
+        pred = pred[..., crop_border:-crop_border, crop_border:-crop_border]
+        target = target[..., crop_border:-crop_border, crop_border:-crop_border]
+
+    window_size = int(min(window_size, pred.shape[-2], pred.shape[-1]))
+    if window_size % 2 == 0:
+        window_size -= 1
+    if window_size < 1:
+        raise ValueError("SSIM input is too small.")
+    coordinates = torch.arange(
+        window_size,
+        device=pred.device,
+        dtype=pred.dtype,
+    ) - window_size // 2
+    kernel = torch.exp(-(coordinates ** 2) / (2 * float(sigma) ** 2))
+    kernel = kernel / kernel.sum()
+    kernel = kernel[:, None] * kernel[None, :]
+    channels = pred.shape[1]
+    kernel = kernel.view(1, 1, window_size, window_size).expand(
+        channels, 1, -1, -1
+    )
+    padding = window_size // 2
+
+    def filter_image(image):
+        mode = "reflect" if min(image.shape[-2:]) > padding else "replicate"
+        padded = F.pad(image, (padding, padding, padding, padding), mode=mode)
+        return F.conv2d(padded, kernel, groups=channels)
+
+    mean_pred = filter_image(pred)
+    mean_target = filter_image(target)
+    variance_pred = filter_image(pred * pred) - mean_pred * mean_pred
+    variance_target = filter_image(target * target) - mean_target * mean_target
+    covariance = filter_image(pred * target) - mean_pred * mean_target
+    c1 = 0.01 ** 2
+    c2 = 0.03 ** 2
+    numerator = (2 * mean_pred * mean_target + c1) * (
+        2 * covariance + c2
+    )
+    denominator = (
+        mean_pred * mean_pred + mean_target * mean_target + c1
+    ) * (variance_pred + variance_target + c2)
+    return (numerator / denominator.clamp_min(1e-12)).mean().item()
+
+
 @torch.no_grad()
 def forward_tiled(model, x, scale, tile_size=0, tile_pad=24):
     """Run tiled inference in LR coordinates and crop overlaps when stitching."""
